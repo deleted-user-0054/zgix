@@ -55,6 +55,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          read_rss_kb() {
+            local pid="$1"
+            local rss
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [ -z "$rss" ]; then
+              echo 0
+            else
+              echo "$rss"
+            fi
+          }
+
           START=$(date +%s%N)
           zig build example-benchmark -Doptimize=ReleaseFast
           END=$(date +%s%N)
@@ -107,21 +118,21 @@ jobs:
             local result_file
             result_file=$(mktemp)
             local rss_kb
-            rss_kb=$(ps -o rss= -p "$ZONO_PID" | tr -d ' ')
+            rss_kb=$(read_rss_kb "$ZONO_PID")
 
-            echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s ${url}"
+            echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s ${url}" >&2
             wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" "$url" >/dev/null
 
             for run in $(seq 1 "$BENCH_RUNS"); do
-              echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s ${url}"
+              echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s ${url}" >&2
               WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" "$url")
-              echo "$WRK_OUT"
+              echo "$WRK_OUT" >&2
 
               RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
               LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
               printf '%s\t%s\t%s\n' "$run" "$RPS" "$LAT" >> "$result_file"
 
-              RSS_AFTER=$(ps -o rss= -p "$ZONO_PID" | tr -d ' ')
+              RSS_AFTER=$(read_rss_kb "$ZONO_PID")
               if [ "$RSS_AFTER" -gt "$rss_kb" ]; then
                 rss_kb=$RSS_AFTER
               fi
@@ -139,7 +150,7 @@ jobs:
           if [ "$ZONO_CONTEXT_RSS_KB" -gt "$ZONO_RSS_KB" ]; then
             ZONO_RSS_KB=$ZONO_CONTEXT_RSS_KB
           fi
-          ZONO_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $ZONO_RSS_KB / 1024}")
+          ZONO_RAM_MB=$(awk "BEGIN{printf \"%.1f\", ${ZONO_RSS_KB:-0} / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"
@@ -188,6 +199,17 @@ jobs:
           MERJS_BASELINE_REF: ${{ env.MERJS_BASELINE_REF }}
         run: |
           set -euo pipefail
+
+          read_rss_kb() {
+            local pid="$1"
+            local rss
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [ -z "$rss" ]; then
+              echo 0
+            else
+              echo "$rss"
+            fi
+          }
 
           git init merjs-baseline
           cd merjs-baseline
@@ -272,7 +294,7 @@ jobs:
 
           RESULT_FILE=$(mktemp)
           trap 'rm -f "$RESULT_FILE"; kill $MERJS_PID 2>/dev/null || true' EXIT
-          MERJS_RSS_KB=$(ps -o rss= -p "$MERJS_PID" | tr -d ' ')
+          MERJS_RSS_KB=$(read_rss_kb "$MERJS_PID")
 
           for run in $(seq 1 "$BENCH_RUNS"); do
             echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3002/api/json"
@@ -283,7 +305,7 @@ jobs:
             MERJS_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
             printf '%s\t%s\t%s\n' "$run" "$MERJS_RPS" "$MERJS_LAT" >> "$RESULT_FILE"
 
-            MERJS_RSS_AFTER=$(ps -o rss= -p "$MERJS_PID" | tr -d ' ')
+            MERJS_RSS_AFTER=$(read_rss_kb "$MERJS_PID")
             if [ "$MERJS_RSS_AFTER" -gt "$MERJS_RSS_KB" ]; then
               MERJS_RSS_KB=$MERJS_RSS_AFTER
             fi
@@ -292,7 +314,7 @@ jobs:
           MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
           MERJS_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
           MERJS_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
-          MERJS_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $MERJS_RSS_KB / 1024}")
+          MERJS_RAM_MB=$(awk "BEGIN{printf \"%.1f\", ${MERJS_RSS_KB:-0} / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"
@@ -339,6 +361,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          read_rss_kb() {
+            local pid="$1"
+            local rss
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [ -z "$rss" ]; then
+              echo 0
+            else
+              echo "$rss"
+            fi
+          }
+
           bun x create-next-app@latest nextjs-baseline \
             --yes --ts --tailwind --app --eslint --use-bun
           mkdir -p nextjs-baseline/app/api/json
@@ -384,7 +417,7 @@ jobs:
 
           RESULT_FILE=$(mktemp)
           trap 'rm -f "$RESULT_FILE"; kill $NEXT_PID 2>/dev/null || true' EXIT
-          NEXT_RSS_KB=$(ps -o rss= -p "$NEXT_PID" | tr -d ' ')
+          NEXT_RSS_KB=$(read_rss_kb "$NEXT_PID")
 
           for run in $(seq 1 "$BENCH_RUNS"); do
             echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3001/api/json"
@@ -395,7 +428,7 @@ jobs:
             NEXT_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
             printf '%s\t%s\t%s\n' "$run" "$NEXT_RPS" "$NEXT_LAT" >> "$RESULT_FILE"
 
-            NEXT_RSS_AFTER=$(ps -o rss= -p "$NEXT_PID" | tr -d ' ')
+            NEXT_RSS_AFTER=$(read_rss_kb "$NEXT_PID")
             if [ "$NEXT_RSS_AFTER" -gt "$NEXT_RSS_KB" ]; then
               NEXT_RSS_KB=$NEXT_RSS_AFTER
             fi
@@ -404,7 +437,7 @@ jobs:
           MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
           NEXT_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
           NEXT_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
-          NEXT_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $NEXT_RSS_KB / 1024}")
+          NEXT_RAM_MB=$(awk "BEGIN{printf \"%.1f\", ${NEXT_RSS_KB:-0} / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"

@@ -13,7 +13,7 @@ env:
   ZGIX_ZIG_VERSION: 0.16.0
   MERJS_ZIG_VERSION: 0.16.0
   MERJS_BASELINE_REF: v0.2.5
-  NODE_VERSION: 20
+  BUN_VERSION: latest
 
 jobs:
   benchmark_zgix:
@@ -253,13 +253,14 @@ jobs:
       requests_per_sec: ${{ steps.bench.outputs.requests_per_sec }}
       avg_latency: ${{ steps.bench.outputs.avg_latency }}
       ram_mb: ${{ steps.bench.outputs.ram_mb }}
-      node_version: ${{ steps.bench.outputs.node_version }}
+      bun_version: ${{ steps.bench.outputs.bun_version }}
 
     steps:
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Bun
+        id: setup_bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install wrk
         run: sudo apt-get update && sudo apt-get install -y wrk
@@ -267,12 +268,12 @@ jobs:
       - name: Benchmark Next.js
         id: bench
         env:
-          NODE_VERSION: ${{ env.NODE_VERSION }}
+          BUN_VERSION: ${{ steps.setup_bun.outputs.bun-version }}
         run: |
           set -euo pipefail
 
-          npx -y create-next-app@latest nextjs-baseline \
-            --yes --ts --tailwind --app --eslint --use-npm
+          bun x create-next-app@latest nextjs-baseline \
+            --yes --ts --tailwind --app --eslint --use-bun
           mkdir -p nextjs-baseline/app/api/json
           cat > nextjs-baseline/app/api/json/route.ts <<'EOF'
           export async function GET() {
@@ -282,7 +283,7 @@ jobs:
 
           cd nextjs-baseline
           START=$(date +%s%N)
-          npm run build
+          bun run build
           END=$(date +%s%N)
           BUILD_MS=$(( (END - START) / 1000000 ))
 
@@ -291,7 +292,7 @@ jobs:
           NEXT_NM_FILES=$(find node_modules -type f | wc -l)
           NEXT_DOT_NEXT_SIZE=$(du -sh .next 2>/dev/null | cut -f1 || echo "N/A")
 
-          npx next start -p 3001 &
+          bun run start -- --port 3001 &
           NEXT_PID=$!
           trap 'kill $NEXT_PID 2>/dev/null || true' EXIT
 
@@ -324,7 +325,7 @@ jobs:
             echo "dot_next_size=$NEXT_DOT_NEXT_SIZE"
             echo "requests_per_sec=$NEXT_RPS"
             echo "ram_mb=$NEXT_RAM_MB"
-            echo "node_version=$NODE_VERSION"
+            echo "bun_version=$BUN_VERSION"
             echo "avg_latency<<EOF"
             echo "$NEXT_LAT"
             echo "EOF"
@@ -369,7 +370,7 @@ jobs:
       NEXTJS_RPS: ${{ needs.benchmark_nextjs.outputs.requests_per_sec || 'n/a' }}
       NEXTJS_LAT: ${{ needs.benchmark_nextjs.outputs.avg_latency || 'n/a' }}
       NEXTJS_RAM_MB: ${{ needs.benchmark_nextjs.outputs.ram_mb || 'n/a' }}
-      NEXTJS_NODE_VERSION: ${{ needs.benchmark_nextjs.outputs.node_version || '20' }}
+      NEXTJS_BUN_VERSION: ${{ needs.benchmark_nextjs.outputs.bun_version || 'latest' }}
 
     steps:
       - name: Checkout zgix
@@ -394,7 +395,7 @@ jobs:
 
           echo "| zgix | $ZGIX_RESULT | Zig $ZGIX_ZIG_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "| merjs | $MERJS_RESULT | Zig $MERJS_ZIG_VERSION (\`$MERJS_BASELINE_REF\` release) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Next.js | $NEXTJS_RESULT | Node.js $NEXTJS_NODE_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Next.js | $NEXTJS_RESULT | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
@@ -407,7 +408,7 @@ jobs:
           echo "| Server binary / node_modules | $ZGIX_BINARY_SIZE | $MERJS_BINARY_SIZE | $NEXTJS_NODE_MODULES_SIZE |" >> $GITHUB_STEP_SUMMARY
           echo "| Build output | - | - | $NEXTJS_DOT_NEXT_SIZE (.next/) |" >> $GITHUB_STEP_SUMMARY
           echo "| Source files / node_modules files | $ZGIX_SOURCE_FILES files | $MERJS_SOURCE_FILES files | $NEXTJS_NODE_MODULES_FILES files |" >> $GITHUB_STEP_SUMMARY
-          echo "| Runtime deps | 0 | 0 | Node.js >= 18 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime deps | 0 | 0 | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "| **Requests/sec** (wrk, 2t/100c/10s) | **${ZGIX_RPS}** | **${MERJS_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
           echo "| **Avg latency** | **${ZGIX_LAT}** | **${MERJS_LAT}** | **${NEXTJS_LAT}** |" >> $GITHUB_STEP_SUMMARY
           echo "| **RAM usage** (under load) | **${ZGIX_RAM_MB} MB** | **${MERJS_RAM_MB} MB** | **${NEXTJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
@@ -464,7 +465,7 @@ jobs:
                   "node_modules_bytes": int(os.environ["NEXTJS_NODE_MODULES_BYTES"]),
                   "node_modules_files": int(os.environ["NEXTJS_NODE_MODULES_FILES"]),
                   "dot_next_size": os.environ["NEXTJS_DOT_NEXT_SIZE"],
-                  "node_version": os.environ["NEXTJS_NODE_VERSION"],
+                  "bun_version": os.environ["NEXTJS_BUN_VERSION"],
               },
           }
 

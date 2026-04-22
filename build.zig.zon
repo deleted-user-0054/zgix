@@ -1,0 +1,15 @@
+.{
+    .name = .zgix,
+    .version = "0.1.0",
+    .fingerprint = 0x82bf6ba1581a8d44,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "CHANGELOG.md",
+        "lib.zig",
+        "README.md",
+        "examples",
+        "src",
+    },
+}

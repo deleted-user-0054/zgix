@@ -11,6 +11,78 @@ const HeadersCollectFn = *const fn (ctx: *const anyopaque, allocator: std.mem.Al
 pub const FormError = std.mem.Allocator.Error || error{
     InvalidPercentEncoding,
 };
+pub const ParseBodyError = FormError || error{
+    UnsupportedContentType,
+};
+
+pub const ParseBodyOptions = struct {
+    all: bool = false,
+};
+
+pub const ParsedBodyEntry = struct {
+    key: []const u8,
+    values: [][]const u8,
+    array_like: bool = false,
+};
+
+pub const ParsedBodyField = struct {
+    values: []const []const u8,
+    array_like: bool = false,
+
+    pub fn value(self: ParsedBodyField) ?[]const u8 {
+        if (self.values.len == 0) return null;
+        return self.values[self.values.len - 1];
+    }
+
+    pub fn all(self: ParsedBodyField) []const []const u8 {
+        return self.values;
+    }
+
+    pub fn isArray(self: ParsedBodyField) bool {
+        return self.array_like or self.values.len > 1;
+    }
+};
+
+pub const ParsedBody = struct {
+    allocator: std.mem.Allocator,
+    entries: []const ParsedBodyEntry = &.{},
+
+    pub fn get(self: ParsedBody, name: []const u8) ?ParsedBodyField {
+        for (self.entries) |entry| {
+            if (std.mem.eql(u8, entry.key, name)) {
+                return .{
+                    .values = entry.values,
+                    .array_like = entry.array_like,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn value(self: ParsedBody, name: []const u8) ?[]const u8 {
+        return if (self.get(name)) |field| field.value() else null;
+    }
+
+    pub fn values(self: ParsedBody, name: []const u8) ?[]const []const u8 {
+        return if (self.get(name)) |field| field.values else null;
+    }
+
+    pub fn entriesSlice(self: ParsedBody) []const ParsedBodyEntry {
+        return self.entries;
+    }
+
+    pub fn deinit(self: *ParsedBody) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.key);
+            for (entry.values) |entry_value| {
+                self.allocator.free(entry_value);
+            }
+            self.allocator.free(entry.values);
+        }
+        if (self.entries.len > 0) self.allocator.free(self.entries);
+        self.entries = &.{};
+    }
+};
 
 pub const Request = struct {
     allocator: std.mem.Allocator,
@@ -142,6 +214,42 @@ pub const Request = struct {
         });
     }
 
+    pub fn parseBody(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedBody {
+        if (self.body.len == 0) {
+            return .{
+                .allocator = self.allocator,
+            };
+        }
+        if (!self.hasContentType("application/x-www-form-urlencoded")) {
+            return error.UnsupportedContentType;
+        }
+
+        var entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
+        errdefer deinitParsedBodyEntries(self.allocator, entries.items);
+        errdefer entries.deinit(self.allocator);
+
+        var rest = self.body;
+        while (rest.len > 0) {
+            const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+            const pair = rest[0..amp];
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+            const key_raw = pair[0..eq];
+            const value_raw = if (eq < pair.len) pair[eq + 1 ..] else "";
+            const key = try decodeFormComponent(self.allocator, key_raw);
+            errdefer self.allocator.free(key);
+            const value = try decodeFormComponent(self.allocator, value_raw);
+            errdefer self.allocator.free(value);
+
+            try appendParsedBodyEntry(self.allocator, &entries, key, value, body_options);
+            rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+        }
+
+        return .{
+            .allocator = self.allocator,
+            .entries = try entries.toOwnedSlice(self.allocator),
+        };
+    }
+
     pub fn formValue(self: Request, name: []const u8) FormError!?[]const u8 {
         if (!self.hasContentType("application/x-www-form-urlencoded") or self.body.len == 0) return null;
 
@@ -188,7 +296,7 @@ pub const Request = struct {
 };
 
 fn decodeFormComponent(allocator: std.mem.Allocator, input: []const u8) FormError![]const u8 {
-    if (input.len == 0) return "";
+    if (input.len == 0) return try allocator.alloc(u8, 0);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -210,6 +318,54 @@ fn decodeFormComponent(allocator: std.mem.Allocator, input: []const u8) FormErro
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn appendParsedBodyEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(ParsedBodyEntry),
+    key: []const u8,
+    value: []const u8,
+    body_options: ParseBodyOptions,
+) std.mem.Allocator.Error!void {
+    const collect_all_values = body_options.all or std.mem.endsWith(u8, key, "[]");
+
+    for (entries.items) |*entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+
+        allocator.free(key);
+
+        if (collect_all_values) {
+            const new_values = try allocator.alloc([]const u8, entry.values.len + 1);
+            @memcpy(new_values[0..entry.values.len], entry.values);
+            new_values[entry.values.len] = value;
+            allocator.free(entry.values);
+            entry.values = new_values;
+            entry.array_like = true;
+            return;
+        }
+
+        allocator.free(entry.values[entry.values.len - 1]);
+        entry.values[entry.values.len - 1] = value;
+        return;
+    }
+
+    const values = try allocator.alloc([]const u8, 1);
+    values[0] = value;
+    try entries.append(allocator, .{
+        .key = key,
+        .values = values,
+        .array_like = std.mem.endsWith(u8, key, "[]"),
+    });
+}
+
+fn deinitParsedBodyEntries(allocator: std.mem.Allocator, entries: []const ParsedBodyEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.key);
+        for (entry.values) |entry_value| {
+            allocator.free(entry_value);
+        }
+        allocator.free(entry.values);
+    }
 }
 
 test "request queryParam returns first matching value" {
@@ -319,4 +475,57 @@ test "request formValues collects repeated fields" {
     try std.testing.expectEqualStrings("zig", values[0]);
     try std.testing.expectEqualStrings("web toolkit", values[1]);
     try std.testing.expectEqualStrings("router", values[2]);
+}
+
+test "request parseBody keeps the last scalar value and preserves array-like keys" {
+    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
+    parsed_req.headers = &.{
+        .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
+    };
+    parsed_req.body = "title=hello&title=updated&tag%5B%5D=zig&tag%5B%5D=router&empty";
+
+    var body = try parsed_req.parseBody(.{});
+    defer body.deinit();
+
+    try std.testing.expectEqualStrings("updated", body.value("title").?);
+    try std.testing.expect(body.get("title").?.isArray() == false);
+
+    const tags = body.values("tag[]").?;
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqualStrings("zig", tags[0]);
+    try std.testing.expectEqualStrings("router", tags[1]);
+    try std.testing.expect(body.get("tag[]").?.isArray());
+
+    try std.testing.expectEqualStrings("", body.value("empty").?);
+}
+
+test "request parseBody all collects repeated scalar fields" {
+    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
+    parsed_req.headers = &.{
+        .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
+    };
+    parsed_req.body = "tag=zig&tag=web+toolkit&tag=router";
+
+    var body = try parsed_req.parseBody(.{
+        .all = true,
+    });
+    defer body.deinit();
+
+    const tags = body.values("tag").?;
+    try std.testing.expectEqual(@as(usize, 3), tags.len);
+    try std.testing.expectEqualStrings("zig", tags[0]);
+    try std.testing.expectEqualStrings("web toolkit", tags[1]);
+    try std.testing.expectEqualStrings("router", tags[2]);
+    try std.testing.expect(body.get("tag").?.isArray());
+    try std.testing.expectEqualStrings("router", body.value("tag").?);
+}
+
+test "request parseBody rejects unsupported content types" {
+    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
+    parsed_req.headers = &.{
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    parsed_req.body = "{\"title\":\"hello\"}";
+
+    try std.testing.expectError(error.UnsupportedContentType, parsed_req.parseBody(.{}));
 }

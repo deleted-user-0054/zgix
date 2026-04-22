@@ -2,11 +2,56 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 
 pub const Response = struct {
+    pub const inline_header_capacity = 8;
+
     status: std.http.Status,
     content_type: []const u8,
     body: []const u8,
     location: ?[]const u8 = null,
     allow: ?[]const u8 = null,
+    extra_headers: [inline_header_capacity]std.http.Header = undefined,
+    extra_header_count: usize = 0,
+
+    pub fn header(self: *Response, name: []const u8, value: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            self.content_type = value;
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "location")) {
+            self.location = value;
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "allow")) {
+            self.allow = value;
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "set-cookie")) {
+            return self.appendHeader(name, value);
+        }
+
+        for (self.extra_headers[0..self.extra_header_count]) |*entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                entry.* = .{ .name = name, .value = value };
+                return true;
+            }
+        }
+
+        return self.appendHeader(name, value);
+    }
+
+    pub fn appendHeader(self: *Response, name: []const u8, value: []const u8) bool {
+        if (self.extra_header_count >= self.extra_headers.len) return false;
+        self.extra_headers[self.extra_header_count] = .{
+            .name = name,
+            .value = value,
+        };
+        self.extra_header_count += 1;
+        return true;
+    }
+
+    pub fn extraHeaders(self: *const Response) []const std.http.Header {
+        return self.extra_headers[0..self.extra_header_count];
+    }
 };
 
 pub fn html(body: []const u8) Response {
@@ -76,8 +121,7 @@ pub fn typedJson(allocator: std.mem.Allocator, value: anytype) Response {
 }
 
 pub fn parseJson(comptime T: type, req: Request) !?std.json.Parsed(T) {
-    if (req.body.len == 0) return null;
-    return try std.json.parseFromSlice(T, req.allocator, req.body, .{ .ignore_unknown_fields = true });
+    return try req.json(T);
 }
 
 test "typedJson serializes into response body" {
@@ -98,4 +142,21 @@ test "redirect chooses 301 for GET and 308 otherwise" {
     try std.testing.expectEqual(std.http.Status.moved_permanently, get_res.status);
     try std.testing.expectEqual(std.http.Status.permanent_redirect, post_res.status);
     try std.testing.expectEqualStrings("/users", get_res.location.?);
+}
+
+test "response inline headers support overwrite and append" {
+    var res = text(.ok, "ok");
+
+    try std.testing.expect(res.header("cache-control", "max-age=60"));
+    try std.testing.expect(res.header("Cache-Control", "no-store"));
+    try std.testing.expect(res.header("content-type", "application/problem+json"));
+    try std.testing.expect(res.appendHeader("set-cookie", "a=1"));
+    try std.testing.expect(res.appendHeader("set-cookie", "b=2"));
+
+    const headers = res.extraHeaders();
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("application/problem+json", res.content_type);
+    try std.testing.expectEqualStrings("no-store", headers[0].value);
+    try std.testing.expectEqualStrings("a=1", headers[1].value);
+    try std.testing.expectEqualStrings("b=2", headers[2].value);
 }

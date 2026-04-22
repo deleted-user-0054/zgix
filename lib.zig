@@ -10,6 +10,7 @@ pub const path = root.path;
 
 pub const Request = root.Request;
 pub const Param = root.Param;
+pub const Header = root.Header;
 pub const Response = root.Response;
 pub const App = root.App;
 pub const Router = root.Router;

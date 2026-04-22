@@ -16,6 +16,7 @@ pub const Route = struct {
 pub const LookupResult = struct {
     handler: ?Handler = null,
     params: []const Param = &.{},
+    params_owned: bool = false,
     tsr: bool = false,
 };
 
@@ -467,16 +468,23 @@ pub const Router = struct {
 
     pub fn lookup(self: *const Router, req: Request) LookupResult {
         const tree = self.findTree(req.method) orelse return .{};
-        var stack_params: [8]Param = undefined;
-        const params = if (tree.max_params <= stack_params.len)
-            stack_params[0..tree.max_params]
-        else
-            req.allocator.alloc(Param, tree.max_params) catch return .{};
+        if (tree.max_params == 0) {
+            const match_without_params = tree.root.getValue(req.path, &.{});
+            return .{
+                .handler = match_without_params.handler,
+                .params = &.{},
+                .params_owned = false,
+                .tsr = match_without_params.tsr,
+            };
+        }
+
+        const params = req.allocator.alloc(Param, tree.max_params) catch return .{};
 
         const match = tree.root.getValue(req.path, params);
         return .{
             .handler = match.handler,
             .params = params[0..match.param_count],
+            .params_owned = true,
             .tsr = match.tsr,
         };
     }
@@ -484,6 +492,7 @@ pub const Router = struct {
     pub fn dispatch(self: *const Router, req: Request) Response {
         const result = self.lookup(req);
         const handler = result.handler orelse return response_mod.notFound();
+        defer if (result.params_owned and result.params.len > 0) req.allocator.free(result.params);
         var routed_req = req;
         routed_req.params = result.params;
         return handler(routed_req);

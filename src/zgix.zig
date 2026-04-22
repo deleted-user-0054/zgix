@@ -8,6 +8,7 @@ pub const path = @import("path.zig");
 
 pub const Request = request.Request;
 pub const Param = request.Param;
+pub const Header = request.Header;
 pub const Response = response.Response;
 pub const App = app.App;
 pub const Router = router.Router;

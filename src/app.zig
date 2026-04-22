@@ -745,6 +745,28 @@ test "app basePath and route compose prefixed sub-apps" {
     try std.testing.expectEqualStrings("42", detail_res.body);
 }
 
+test "app routes expose aggregated params views" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/users/:id/posts/:slug", struct {
+        fn run(req: Request) Response {
+            var params = req.parseParams(.{}) catch return response_mod.internalError("params parse failed");
+            defer params.deinit();
+
+            const slug = params.value("slug") orelse "missing";
+            const body = req.allocator.dupe(u8, slug) catch return response_mod.internalError("params alloc failed");
+            return response_mod.text(.ok, body);
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/users/42/posts/hello-zig"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("hello-zig", res.body);
+}
+
 test "app mount delegates prefixed requests to mounted apps" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();

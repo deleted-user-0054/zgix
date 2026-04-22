@@ -119,6 +119,34 @@ pub const Request = struct {
         return self.params;
     }
 
+    pub fn parseParams(self: Request, param_options: ParseBodyOptions) std.mem.Allocator.Error!ParsedBody {
+        if (self.params.len == 0) {
+            return .{
+                .allocator = self.allocator,
+            };
+        }
+
+        var entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
+        errdefer {
+            deinitParsedBodyEntries(self.allocator, entries.items);
+            entries.deinit(self.allocator);
+        }
+
+        for (self.params) |param_entry| {
+            const key = try self.allocator.dupe(u8, param_entry.key);
+            errdefer self.allocator.free(key);
+            const value = try self.allocator.dupe(u8, param_entry.value);
+            errdefer self.allocator.free(value);
+
+            try appendParsedBodyEntry(self.allocator, &entries, key, value, param_options);
+        }
+
+        return .{
+            .allocator = self.allocator,
+            .entries = try entries.toOwnedSlice(self.allocator),
+        };
+    }
+
     pub fn queryParam(self: Request, name: []const u8) ?[]const u8 {
         var rest = self.query_string;
         while (rest.len > 0) {
@@ -254,8 +282,7 @@ pub const Request = struct {
         if (self.hasContentType("multipart/form-data")) {
             const raw_content_type = self.header("content-type") orelse return error.MissingMultipartBoundary;
             return try parseMultipartBody(self.allocator, raw_content_type, self.body, body_options);
-        }
-        else {
+        } else {
             return error.UnsupportedContentType;
         }
     }
@@ -585,6 +612,58 @@ test "request queryParam returns first matching value" {
     try std.testing.expectEqualStrings("zig", req.queryParam("q").?);
     try std.testing.expectEqualStrings("2", req.queryParam("page").?);
     try std.testing.expect(req.queryParam("missing") == null);
+}
+
+test "request parseParams returns an aggregated params view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/users/42");
+    req.params = &.{
+        .{ .key = "id", .value = "41" },
+        .{ .key = "id", .value = "42" },
+        .{ .key = "tag[]", .value = "zig" },
+        .{ .key = "tag[]", .value = "router" },
+        .{ .key = "slug", .value = "readme" },
+    };
+
+    var parsed = try req.parseParams(.{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("42", parsed.value("id").?);
+    try std.testing.expect(!parsed.get("id").?.isArray());
+    try std.testing.expectEqualStrings("readme", parsed.value("slug").?);
+
+    const tags = parsed.values("tag[]").?;
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqualStrings("zig", tags[0]);
+    try std.testing.expectEqualStrings("router", tags[1]);
+    try std.testing.expect(parsed.get("tag[]").?.isArray());
+}
+
+test "request parseParams all collects repeated keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/search");
+    req.params = &.{
+        .{ .key = "tag", .value = "zig" },
+        .{ .key = "tag", .value = "web" },
+        .{ .key = "tag", .value = "router" },
+    };
+
+    var parsed = try req.parseParams(.{
+        .all = true,
+    });
+    defer parsed.deinit();
+
+    const tags = parsed.values("tag").?;
+    try std.testing.expectEqual(@as(usize, 3), tags.len);
+    try std.testing.expectEqualStrings("zig", tags[0]);
+    try std.testing.expectEqualStrings("web", tags[1]);
+    try std.testing.expectEqualStrings("router", tags[2]);
+    try std.testing.expect(parsed.get("tag").?.isArray());
+    try std.testing.expectEqualStrings("router", parsed.value("tag").?);
 }
 
 test "request cookie parses raw cookie header" {

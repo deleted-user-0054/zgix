@@ -10,7 +10,7 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Hono-inspired route composition with `basePath()`, `route()`, `mount()`, `on()`, and `all()`
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zgix.Server`
-- Request helpers for params, query strings, parsed query/cookie views, headers, cookies, and typed JSON parsing
+- Request helpers for params, parsed params/query/cookie views, headers, cookies, and typed JSON parsing
 - `application/x-www-form-urlencoded` parsing, text-only `multipart/form-data` `Request.parseBody()`, `Response.cookie()`, and a low-level `zgix.body()` response helper
 - `app.request()` for lightweight route testing without the server runtime
 
@@ -115,6 +115,21 @@ test "search route" {
     defer res.deinit();
 
     try std.testing.expectEqualStrings("zig", res.body);
+}
+```
+
+### Aggregating Path Params
+
+```zig
+const zgix = @import("zgix");
+
+fn showPost(req: zgix.Request) zgix.Response {
+    var params = req.parseParams(.{}) catch return zgix.internalError("invalid params");
+    defer params.deinit();
+
+    const slug = params.value("slug") orelse "missing";
+    const body = req.allocator.dupe(u8, slug) catch return zgix.internalError("alloc failed");
+    return zgix.text(.ok, body);
 }
 ```
 

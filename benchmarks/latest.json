@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-04-22T13:59:13Z",
+  "timestamp": "2026-04-22T14:13:43Z",
   "runner": "ubuntu-latest",
   "target": {
     "zgix_route": "/api/json",
@@ -8,17 +8,17 @@
     "example": "benchmark"
   },
   "zgix": {
-    "requests_per_sec": 111818.72,
-    "avg_latency_ms": "517.49us 820.65us",
-    "ram_mb": 44.1,
+    "requests_per_sec": 118840.87,
+    "avg_latency_ms": "478.78us 791.95us",
+    "ram_mb": 55.2,
     "binary_size": "296K",
-    "binary_bytes": 300792,
+    "binary_bytes": 301176,
     "source_files": 9,
     "zig_version": "0.16.0"
   },
   "merjs": {
-    "requests_per_sec": 81718.52,
-    "avg_latency_ms": "700.53us 435.33us",
+    "requests_per_sec": 78618.59,
+    "avg_latency_ms": "738.82us 733.89us",
     "ram_mb": 3.2,
     "binary_size": "1016K",
     "binary_bytes": 1037784,
@@ -27,8 +27,8 @@
     "baseline_ref": "v0.2.5"
   },
   "nextjs": {
-    "requests_per_sec": 1334.94,
-    "avg_latency_ms": "87.61ms 153.90ms",
+    "requests_per_sec": 1418.65,
+    "avg_latency_ms": "86.21ms 160.95ms",
     "ram_mb": 9.6,
     "node_modules_size": "613M",
     "node_modules_bytes": 575288745,

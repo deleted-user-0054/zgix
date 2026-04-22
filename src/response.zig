@@ -89,6 +89,34 @@ pub const Response = struct {
         self.status = status;
     }
 
+    pub fn setContentType(self: *Response, content_type: []const u8) bool {
+        self.replaceSlice(&self.content_type, content_type) catch return false;
+        return true;
+    }
+
+    pub fn setBody(self: *Response, content: []const u8) bool {
+        self.replaceSlice(&self.body, content) catch return false;
+        return true;
+    }
+
+    pub fn setLocation(self: *Response, location: ?[]const u8) bool {
+        if (location) |value| {
+            self.replaceOptionalSlice(&self.location, value) catch return false;
+        } else {
+            self.clearOptionalSlice(&self.location);
+        }
+        return true;
+    }
+
+    pub fn setAllow(self: *Response, allow: ?[]const u8) bool {
+        if (allow) |value| {
+            self.replaceOptionalSlice(&self.allow, value) catch return false;
+        } else {
+            self.clearOptionalSlice(&self.allow);
+        }
+        return true;
+    }
+
     pub fn deleteHeader(self: *Response, name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
             self.clearSlice(&self.content_type);

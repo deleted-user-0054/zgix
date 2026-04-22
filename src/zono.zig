@@ -3,6 +3,7 @@ pub const request = @import("request.zig");
 pub const response = @import("response.zig");
 pub const router = @import("router.zig");
 pub const app = @import("app.zig");
+pub const context = @import("context.zig");
 pub const server = @import("server.zig");
 pub const path = @import("path.zig");
 
@@ -29,6 +30,7 @@ pub const ParsedFormFileEntry = request.ParsedFormFileEntry;
 pub const ParsedFormFileField = request.ParsedFormFileField;
 pub const Response = response.Response;
 pub const App = app.App;
+pub const Context = context.Context;
 pub const Router = router.Router;
 pub const Route = router.Route;
 pub const Server = server.Server;
@@ -62,6 +64,7 @@ test {
     _ = response;
     _ = router;
     _ = app;
+    _ = context;
     _ = server;
     _ = path;
 
@@ -73,6 +76,7 @@ test {
     try std.testing.expect(!@hasDecl(@This(), "thin"));
 
     try std.testing.expect(@hasDecl(@This(), "App"));
+    try std.testing.expect(@hasDecl(@This(), "Context"));
     try std.testing.expect(@hasDecl(@This(), "Request"));
     try std.testing.expect(@hasDecl(@This(), "Response"));
     try std.testing.expect(@hasDecl(@This(), "Router"));

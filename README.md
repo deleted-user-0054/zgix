@@ -1,17 +1,18 @@
-# zgix
+# zono
 
 A thin Zig web toolkit built around a merjs-style request -> route -> response pipeline.
 
 ## Highlights
 
-- Thin request/response handlers: `fn(req: zgix.Request) zgix.Response`
-- Explicit route registration through `zgix.App`
-- Exact-path plus dynamic-parameter routing through `zgix.Router`
+- Thin request/response handlers: `fn(req: zono.Request) zono.Response`
+- Explicit route registration through `zono.App`
+- Exact-path plus dynamic-parameter routing through `zono.Router`
 - Hono-inspired route composition and middleware with `basePath()`, `route()`, `mount()`, `use()`, `useAt()`, `on()`, and `all()`
+- Minimal Hono-style `Context` handlers and middleware through `fn(c: *zono.Context) zono.Response`
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
-- Minimal server runtime under `zgix.Server`
+- Minimal server runtime under `zono.Server`
 - Request helpers for params, parsed params/query/cookie/header views, header lookup, cookies, and typed JSON parsing
-- `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing through `Request.parseBody()`, `Response.cookie()`, and a low-level `zgix.body()` response helper
+- `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing through `Request.parseBody()`, `Response.cookie()`, and a low-level `zono.body()` response helper
 - `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start
@@ -40,7 +41,8 @@ zig build test
 
 CI benchmarks compare:
 
-- `zgix` `examples/benchmark.zig` on `GET /api/json`
+- `zono` `examples/benchmark.zig` on `GET /api/json`
+- `zono` `examples/benchmark.zig` on `GET /api/context-json` through a `Context` handler
 - A trimmed `merjs` starter-style baseline on `GET /api/json`
   based on upstream release tag `v0.2.5`
   with the release's shipped threaded runtime fallback on Linux CI
@@ -58,10 +60,12 @@ runtime baseline rather than a source-build comparison.
 Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 
 <!-- BENCH:START -->
-| Metric | **zgix** | **merjs** | **Next.js** |
+| Metric | **zono** | **merjs** | **Next.js** |
 |--------|----------|-----------|-------------|
 | Requests/sec (wrk median) | **96141.92** | **82358.91** | **1487.55** |
+| Requests/sec (context route) | **pending CI** | - | - |
 | Avg latency | **569.04us 300.78us** | **713.41us 742.71us** | **86.81ms 158.12ms** |
+| Avg latency (context route) | **pending CI** | - | - |
 | RAM usage (under load) | **49.9 MB** | **3.2 MB** | **9.6 MB** |
 <!-- BENCH:END -->
 
@@ -73,21 +77,21 @@ Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 
 ```zig
 const std = @import("std");
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn listUsers(_: zgix.Request) zgix.Response {
-    return zgix.text(.ok, "users");
+fn listUsers(_: zono.Request) zono.Response {
+    return zono.text(.ok, "users");
 }
 
-fn notFound(req: zgix.Request) zgix.Response {
-    return zgix.text(.not_found, req.path);
+fn notFound(req: zono.Request) zono.Response {
+    return zono.text(.not_found, req.path);
 }
 
 pub fn main() !void {
-    var app = zgix.App.init(std.heap.page_allocator);
+    var app = zono.App.init(std.heap.page_allocator);
     defer app.deinit();
 
-    var users = zgix.App.init(std.heap.page_allocator);
+    var users = zono.App.init(std.heap.page_allocator);
     defer users.deinit();
 
     try app.basePath("/api");
@@ -101,19 +105,45 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn logger(req: zgix.Request, next: zgix.App.Next) zgix.Response {
+fn logger(req: zono.Request, next: zono.App.Next) zono.Response {
     var res = next.run(req);
     _ = res.header("x-middleware", req.path);
     return res;
 }
 
 pub fn main() !void {
-    var app = zgix.App.init(std.heap.page_allocator);
+    var app = zono.App.init(std.heap.page_allocator);
     defer app.deinit();
 
     try app.use(logger);
+}
+```
+
+### Context
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+fn poweredBy(c: *zono.Context, next: zono.Context.Next) zono.Response {
+    _ = c.header("x-powered-by", "zono");
+    next.run();
+    return c.takeResponse();
+}
+
+fn hello(c: *zono.Context) zono.Response {
+    c.status(.created);
+    return c.json("{\"message\":\"hello\"}");
+}
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.use(poweredBy);
+    try app.get("/hello", hello);
 }
 ```
 
@@ -121,14 +151,14 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn search(req: zgix.Request) zgix.Response {
-    return zgix.text(.ok, req.query("q") orelse "missing");
+fn search(req: zono.Request) zono.Response {
+    return zono.text(.ok, req.query("q") orelse "missing");
 }
 
 test "search route" {
-    var app = zgix.App.init(std.testing.allocator);
+    var app = zono.App.init(std.testing.allocator);
     defer app.deinit();
 
     try app.get("/search", search);
@@ -143,48 +173,48 @@ test "search route" {
 ### Aggregating Path Params
 
 ```zig
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn showPost(req: zgix.Request) zgix.Response {
-    var params = req.parseParams(.{}) catch return zgix.internalError("invalid params");
+fn showPost(req: zono.Request) zono.Response {
+    var params = req.parseParams(.{}) catch return zono.internalError("invalid params");
     defer params.deinit();
 
     const slug = params.value("slug") orelse "missing";
-    const body = req.allocator.dupe(u8, slug) catch return zgix.internalError("alloc failed");
-    return zgix.text(.ok, body);
+    const body = req.allocator.dupe(u8, slug) catch return zono.internalError("alloc failed");
+    return zono.text(.ok, body);
 }
 ```
 
 ### Aggregating Headers
 
 ```zig
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn guarded(req: zgix.Request) zgix.Response {
-    var headers = req.header(.all) catch return zgix.internalError("invalid headers");
+fn guarded(req: zono.Request) zono.Response {
+    var headers = req.header(.all) catch return zono.internalError("invalid headers");
     defer headers.deinit();
 
     if (headers.value("x-mode") == null) {
-        return zgix.text(.bad_request, "missing x-mode");
+        return zono.text(.bad_request, "missing x-mode");
     }
 
-    return zgix.text(.ok, "ok");
+    return zono.text(.ok, "ok");
 }
 ```
 
 ### Parsing Multipart Files
 
 ```zig
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn upload(req: zgix.Request) zgix.Response {
-    var body = req.parseBody(.{}) catch return zgix.text(.bad_request, "invalid multipart body");
+fn upload(req: zono.Request) zono.Response {
+    var body = req.parseBody(.{}) catch return zono.text(.bad_request, "invalid multipart body");
     defer body.deinit();
 
-    const avatar = body.file("avatar") orelse return zgix.text(.bad_request, "missing avatar");
+    const avatar = body.file("avatar") orelse return zono.text(.bad_request, "missing avatar");
     _ = avatar;
 
-    return zgix.text(.ok, body.value("display_name") orelse "ok");
+    return zono.text(.ok, body.value("display_name") orelse "ok");
 }
 ```
 
@@ -192,14 +222,14 @@ fn upload(req: zgix.Request) zgix.Response {
 
 ```zig
 const std = @import("std");
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn legacy(req: zgix.Request) zgix.Response {
-    return zgix.text(.ok, req.path);
+fn legacy(req: zono.Request) zono.Response {
+    return zono.text(.ok, req.path);
 }
 
 pub fn main() !void {
-    var app = zgix.App.init(std.heap.page_allocator);
+    var app = zono.App.init(std.heap.page_allocator);
     defer app.deinit();
 
     try app.mount("/legacy", legacy);
@@ -210,10 +240,10 @@ pub fn main() !void {
 
 ```zig
 const std = @import("std");
-const zgix = @import("zgix");
+const zono = @import("zono");
 
 pub fn main() !void {
-    var app = zgix.App.initWithOptions(std.heap.page_allocator, .{
+    var app = zono.App.initWithOptions(std.heap.page_allocator, .{
         .strict = false,
         .handle_options = false,
     });
@@ -224,15 +254,15 @@ pub fn main() !void {
 ### Setting Cookies
 
 ```zig
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn login(req: zgix.Request) zgix.Response {
-    var res = zgix.text(.ok, "ok");
+fn login(req: zono.Request) zono.Response {
+    var res = zono.text(.ok, "ok");
     res.cookie(req.allocator, "session", "abc123", .{
         .http_only = true,
         .secure = true,
         .same_site = .lax,
-    }) catch return zgix.internalError("cookie write failed");
+    }) catch return zono.internalError("cookie write failed");
     return res;
 }
 ```
@@ -240,17 +270,17 @@ fn login(req: zgix.Request) zgix.Response {
 ### Parsing Form Bodies
 
 ```zig
-const zgix = @import("zgix");
+const zono = @import("zono");
 
-fn submit(req: zgix.Request) zgix.Response {
+fn submit(req: zono.Request) zono.Response {
     var body = req.parseBody(.{
         .all = true,
-    }) catch return zgix.text(.bad_request, "invalid form body");
+    }) catch return zono.text(.bad_request, "invalid form body");
     defer body.deinit();
 
     const tags = body.values("tag") orelse &.{};
     _ = tags;
 
-    return zgix.text(.ok, body.value("title") orelse "missing");
+    return zono.text(.ok, body.value("title") orelse "missing");
 }
 ```

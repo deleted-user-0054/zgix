@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("zgix", .{
+    const mod = b.addModule("zono", .{
         .root_source_file = b.path("lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -70,12 +70,12 @@ fn addExample(
         .optimize = optimize,
         .strip = if (optimize != .Debug) true else null,
         .imports = &.{
-            .{ .name = "zgix", .module = mod },
+            .{ .name = "zono", .module = mod },
         },
     });
 
     const artifact = b.addExecutable(.{
-        .name = b.fmt("zgix-{s}", .{example.name}),
+        .name = b.fmt("zono-{s}", .{example.name}),
         .root_module = example_mod,
     });
     const run = b.addRunArtifact(artifact);

@@ -11,12 +11,13 @@
     "aggregation": "median_requests_per_sec_with_matching_latency"
   },
   "target": {
-    "zgix_route": "/api/json",
+    "zono_route": "/api/json",
+    "zono_context_route": "/api/context-json",
     "merjs_route": "/api/json",
     "nextjs_route": "/api/json",
     "example": "benchmark"
   },
-  "zgix": {
+  "zono": {
     "requests_per_sec": 96141.92,
     "avg_latency_ms": "569.04us 300.78us",
     "ram_mb": 49.9,
@@ -24,6 +25,10 @@
     "binary_bytes": 302456,
     "source_files": 9,
     "zig_version": "0.16.0"
+  },
+  "zono_context": {
+    "requests_per_sec": null,
+    "avg_latency_ms": null
   },
   "merjs": {
     "requests_per_sec": 82358.91,

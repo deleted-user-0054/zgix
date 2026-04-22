@@ -1,10 +1,11 @@
-const root = @import("src/zgix.zig");
+const root = @import("src/zono.zig");
 const std = @import("std");
 
 pub const request = root.request;
 pub const response = root.response;
 pub const router = root.router;
 pub const app = root.app;
+pub const context = root.context;
 pub const server = root.server;
 pub const path = root.path;
 
@@ -31,6 +32,7 @@ pub const ParsedFormFileEntry = root.ParsedFormFileEntry;
 pub const ParsedFormFileField = root.ParsedFormFileField;
 pub const Response = root.Response;
 pub const App = root.App;
+pub const Context = root.Context;
 pub const Router = root.Router;
 pub const Route = root.Route;
 pub const Server = root.Server;

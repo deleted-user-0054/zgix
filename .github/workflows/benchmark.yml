@@ -1,4 +1,4 @@
-name: Benchmark - zgix vs merjs vs Next.js
+name: Benchmark - zono vs merjs vs Next.js
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  ZGIX_ZIG_VERSION: 0.16.0
+  ZONO_ZIG_VERSION: 0.16.0
   MERJS_ZIG_VERSION: 0.16.0
   MERJS_BASELINE_REF: v0.2.5
   BUN_VERSION: latest
@@ -21,35 +21,37 @@ env:
   BENCH_RUNS: 3
 
 jobs:
-  benchmark_zgix:
+  benchmark_zono:
     runs-on: ubuntu-latest
-    name: zgix API benchmark
+    name: zono API benchmark
     outputs:
       build_ms: ${{ steps.bench.outputs.build_ms }}
       binary_size: ${{ steps.bench.outputs.binary_size }}
       binary_bytes: ${{ steps.bench.outputs.binary_bytes }}
       source_files: ${{ steps.bench.outputs.source_files }}
       requests_per_sec: ${{ steps.bench.outputs.requests_per_sec }}
+      requests_per_sec_context: ${{ steps.bench.outputs.requests_per_sec_context }}
       avg_latency: ${{ steps.bench.outputs.avg_latency }}
+      avg_latency_context: ${{ steps.bench.outputs.avg_latency_context }}
       ram_mb: ${{ steps.bench.outputs.ram_mb }}
       zig_version: ${{ steps.bench.outputs.zig_version }}
 
     steps:
-      - name: Checkout zgix
+      - name: Checkout zono
         uses: actions/checkout@v4
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: ${{ env.ZGIX_ZIG_VERSION }}
+          version: ${{ env.ZONO_ZIG_VERSION }}
 
       - name: Install wrk
         run: sudo apt-get update && sudo apt-get install -y wrk
 
-      - name: Benchmark zgix
+      - name: Benchmark zono
         id: bench
         env:
-          ZGIX_ZIG_VERSION: ${{ env.ZGIX_ZIG_VERSION }}
+          ZONO_ZIG_VERSION: ${{ env.ZONO_ZIG_VERSION }}
         run: |
           set -euo pipefail
 
@@ -58,12 +60,12 @@ jobs:
           END=$(date +%s%N)
           BUILD_MS=$(( (END - START) / 1000000 ))
 
-          ZGIX_BIN=$(python3 - <<'PY'
+          ZONO_BIN=$(python3 - <<'PY'
           from pathlib import Path
 
           candidates = []
           for path in Path(".zig-cache").rglob("*"):
-              if path.is_file() and path.name in {"zgix-benchmark", "zgix-benchmark.exe"}:
+              if path.is_file() and path.name in {"zono-benchmark", "zono-benchmark.exe"}:
                   candidates.append(path)
 
           candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -71,26 +73,26 @@ jobs:
           PY
           )
 
-          if [ -z "$ZGIX_BIN" ]; then
-            echo "Could not locate the built zgix-benchmark binary" >&2
+          if [ -z "$ZONO_BIN" ]; then
+            echo "Could not locate the built zono-benchmark binary" >&2
             exit 1
           fi
 
-          ZGIX_SIZE=$(du -sh "$ZGIX_BIN" | cut -f1)
-          ZGIX_BYTES=$(stat --format=%s "$ZGIX_BIN")
-          ZGIX_FILES=$( (find src examples -name '*.zig'; echo lib.zig) | wc -l )
+          ZONO_SIZE=$(du -sh "$ZONO_BIN" | cut -f1)
+          ZONO_BYTES=$(stat --format=%s "$ZONO_BIN")
+          ZONO_FILES=$( (find src examples -name '*.zig'; echo lib.zig) | wc -l )
 
-          "$ZGIX_BIN" &
-          ZGIX_PID=$!
-          trap 'kill $ZGIX_PID 2>/dev/null || true' EXIT
+          "$ZONO_BIN" &
+          ZONO_PID=$!
+          trap 'kill $ZONO_PID 2>/dev/null || true' EXIT
 
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:3003/api/json >/dev/null; then
+            if curl -fsS http://127.0.0.1:3003/api/json >/dev/null && curl -fsS http://127.0.0.1:3003/api/context-json >/dev/null; then
               break
             fi
             sleep 1
             if [ "$attempt" -eq 30 ]; then
-              echo "zgix benchmark server did not become ready in time" >&2
+              echo "zono benchmark server did not become ready in time" >&2
               exit 1
             fi
           done
@@ -100,43 +102,59 @@ jobs:
             exit 1
           fi
 
-          echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s http://127.0.0.1:3003/api/json"
-          wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" http://127.0.0.1:3003/api/json >/dev/null
+          run_wrk_median() {
+            local url="$1"
+            local result_file
+            result_file=$(mktemp)
+            local rss_kb
+            rss_kb=$(ps -o rss= -p "$ZONO_PID" | tr -d ' ')
 
-          RESULT_FILE=$(mktemp)
-          trap 'rm -f "$RESULT_FILE"; kill $ZGIX_PID 2>/dev/null || true' EXIT
-          ZGIX_RSS_KB=$(ps -o rss= -p "$ZGIX_PID" | tr -d ' ')
+            echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s ${url}"
+            wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" "$url" >/dev/null
 
-          for run in $(seq 1 "$BENCH_RUNS"); do
-            echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3003/api/json"
-            WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" http://127.0.0.1:3003/api/json)
-            echo "$WRK_OUT"
+            for run in $(seq 1 "$BENCH_RUNS"); do
+              echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s ${url}"
+              WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" "$url")
+              echo "$WRK_OUT"
 
-            ZGIX_RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
-            ZGIX_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
-            printf '%s\t%s\t%s\n' "$run" "$ZGIX_RPS" "$ZGIX_LAT" >> "$RESULT_FILE"
+              RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+              LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
+              printf '%s\t%s\t%s\n' "$run" "$RPS" "$LAT" >> "$result_file"
 
-            ZGIX_RSS_AFTER=$(ps -o rss= -p "$ZGIX_PID" | tr -d ' ')
-            if [ "$ZGIX_RSS_AFTER" -gt "$ZGIX_RSS_KB" ]; then
-              ZGIX_RSS_KB=$ZGIX_RSS_AFTER
-            fi
-          done
+              RSS_AFTER=$(ps -o rss= -p "$ZONO_PID" | tr -d ' ')
+              if [ "$RSS_AFTER" -gt "$rss_kb" ]; then
+                rss_kb=$RSS_AFTER
+              fi
+            done
 
-          MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
-          ZGIX_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
-          ZGIX_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
-          ZGIX_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $ZGIX_RSS_KB / 1024}")
+            MEDIAN_ROW=$(sort -k2,2n "$result_file" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
+            RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
+            LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
+            rm -f "$result_file"
+            printf '%s\t%s\t%s\n' "$RPS" "$LAT" "$rss_kb"
+          }
+
+          IFS=$'\t' read -r ZONO_RPS ZONO_LAT ZONO_RSS_KB <<< "$(run_wrk_median http://127.0.0.1:3003/api/json)"
+          IFS=$'\t' read -r ZONO_CONTEXT_RPS ZONO_CONTEXT_LAT ZONO_CONTEXT_RSS_KB <<< "$(run_wrk_median http://127.0.0.1:3003/api/context-json)"
+          if [ "$ZONO_CONTEXT_RSS_KB" -gt "$ZONO_RSS_KB" ]; then
+            ZONO_RSS_KB=$ZONO_CONTEXT_RSS_KB
+          fi
+          ZONO_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $ZONO_RSS_KB / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"
-            echo "binary_size=$ZGIX_SIZE"
-            echo "binary_bytes=$ZGIX_BYTES"
-            echo "source_files=$ZGIX_FILES"
-            echo "requests_per_sec=$ZGIX_RPS"
-            echo "ram_mb=$ZGIX_RAM_MB"
-            echo "zig_version=$ZGIX_ZIG_VERSION"
+            echo "binary_size=$ZONO_SIZE"
+            echo "binary_bytes=$ZONO_BYTES"
+            echo "source_files=$ZONO_FILES"
+            echo "requests_per_sec=$ZONO_RPS"
+            echo "requests_per_sec_context=$ZONO_CONTEXT_RPS"
+            echo "ram_mb=$ZONO_RAM_MB"
+            echo "zig_version=$ZONO_ZIG_VERSION"
             echo "avg_latency<<EOF"
-            echo "$ZGIX_LAT"
+            echo "$ZONO_LAT"
+            echo "EOF"
+            echo "avg_latency_context<<EOF"
+            echo "$ZONO_CONTEXT_LAT"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -406,20 +424,22 @@ jobs:
     runs-on: ubuntu-latest
     name: Publish benchmark summary
     needs:
-      - benchmark_zgix
+      - benchmark_zono
       - benchmark_merjs
       - benchmark_nextjs
     if: ${{ always() }}
     env:
-      ZGIX_RESULT: ${{ needs.benchmark_zgix.result }}
-      ZGIX_BUILD_MS: ${{ needs.benchmark_zgix.outputs.build_ms || '0' }}
-      ZGIX_BINARY_SIZE: ${{ needs.benchmark_zgix.outputs.binary_size || 'n/a' }}
-      ZGIX_BINARY_BYTES: ${{ needs.benchmark_zgix.outputs.binary_bytes || '0' }}
-      ZGIX_SOURCE_FILES: ${{ needs.benchmark_zgix.outputs.source_files || '0' }}
-      ZGIX_RPS: ${{ needs.benchmark_zgix.outputs.requests_per_sec || 'n/a' }}
-      ZGIX_LAT: ${{ needs.benchmark_zgix.outputs.avg_latency || 'n/a' }}
-      ZGIX_RAM_MB: ${{ needs.benchmark_zgix.outputs.ram_mb || 'n/a' }}
-      ZGIX_ZIG_VERSION: ${{ needs.benchmark_zgix.outputs.zig_version || '0.16.0' }}
+      ZONO_RESULT: ${{ needs.benchmark_zono.result }}
+      ZONO_BUILD_MS: ${{ needs.benchmark_zono.outputs.build_ms || '0' }}
+      ZONO_BINARY_SIZE: ${{ needs.benchmark_zono.outputs.binary_size || 'n/a' }}
+      ZONO_BINARY_BYTES: ${{ needs.benchmark_zono.outputs.binary_bytes || '0' }}
+      ZONO_SOURCE_FILES: ${{ needs.benchmark_zono.outputs.source_files || '0' }}
+      ZONO_RPS: ${{ needs.benchmark_zono.outputs.requests_per_sec || 'n/a' }}
+      ZONO_CONTEXT_RPS: ${{ needs.benchmark_zono.outputs.requests_per_sec_context || 'n/a' }}
+      ZONO_LAT: ${{ needs.benchmark_zono.outputs.avg_latency || 'n/a' }}
+      ZONO_CONTEXT_LAT: ${{ needs.benchmark_zono.outputs.avg_latency_context || 'n/a' }}
+      ZONO_RAM_MB: ${{ needs.benchmark_zono.outputs.ram_mb || 'n/a' }}
+      ZONO_ZIG_VERSION: ${{ needs.benchmark_zono.outputs.zig_version || '0.16.0' }}
 
       MERJS_RESULT: ${{ needs.benchmark_merjs.result }}
       MERJS_BUILD_MS: ${{ needs.benchmark_merjs.outputs.build_ms || '0' }}
@@ -444,7 +464,7 @@ jobs:
       NEXTJS_BUN_VERSION: ${{ needs.benchmark_nextjs.outputs.bun_version || 'latest' }}
 
     steps:
-      - name: Checkout zgix
+      - name: Checkout zono
         uses: actions/checkout@v4
 
       - name: Post comparison
@@ -452,8 +472,9 @@ jobs:
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ## Backend API Benchmark
 
-          Target route:
-          `GET /api/json` for zgix, merjs, and Next.js
+          Target routes:
+          `GET /api/json` for zono, merjs, and Next.js
+          `GET /api/context-json` for zono Context handlers
 
           Response shape:
           `{ "ok": true, "framework": "..." }`
@@ -464,7 +485,7 @@ jobs:
           |--------|--------|-----------|
           EOF
 
-          echo "| zgix | $ZGIX_RESULT | Zig $ZGIX_ZIG_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| zono | $ZONO_RESULT | Zig $ZONO_ZIG_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "| merjs | $MERJS_RESULT | Zig $MERJS_ZIG_VERSION (\`$MERJS_BASELINE_REF\` release) |" >> $GITHUB_STEP_SUMMARY
           echo "| Next.js | $NEXTJS_RESULT | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -472,22 +493,24 @@ jobs:
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### Results
 
-          | Metric | **zgix** | **merjs** | **Next.js** |
+          | Metric | **zono** | **merjs** | **Next.js** |
           |--------|----------|-----------|-------------|
           EOF
 
-          echo "| Server binary / node_modules | $ZGIX_BINARY_SIZE | $MERJS_BINARY_SIZE | $NEXTJS_NODE_MODULES_SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Server binary / node_modules | $ZONO_BINARY_SIZE | $MERJS_BINARY_SIZE | $NEXTJS_NODE_MODULES_SIZE |" >> $GITHUB_STEP_SUMMARY
           echo "| Build output | - | - | $NEXTJS_DOT_NEXT_SIZE (.next/) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Source files / node_modules files | $ZGIX_SOURCE_FILES files | $MERJS_SOURCE_FILES files | $NEXTJS_NODE_MODULES_FILES files |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source files / node_modules files | $ZONO_SOURCE_FILES files | $MERJS_SOURCE_FILES files | $NEXTJS_NODE_MODULES_FILES files |" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime deps | 0 | 0 | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Requests/sec** (wrk median, ${BENCH_THREADS}t/${BENCH_CONNECTIONS}c/${BENCH_DURATION_SECONDS}s) | **${ZGIX_RPS}** | **${MERJS_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Avg latency** | **${ZGIX_LAT}** | **${MERJS_LAT}** | **${NEXTJS_LAT}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| **RAM usage** (under load) | **${ZGIX_RAM_MB} MB** | **${MERJS_RAM_MB} MB** | **${NEXTJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requests/sec** (wrk median, ${BENCH_THREADS}t/${BENCH_CONNECTIONS}c/${BENCH_DURATION_SECONDS}s) | **${ZONO_RPS}** | **${MERJS_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requests/sec (context route)** | **${ZONO_CONTEXT_RPS}** | - | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Avg latency** | **${ZONO_LAT}** | **${MERJS_LAT}** | **${NEXTJS_LAT}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Avg latency (context route)** | **${ZONO_CONTEXT_LAT}** | - | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| **RAM usage** (under load) | **${ZONO_RAM_MB} MB** | **${MERJS_RAM_MB} MB** | **${NEXTJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Three isolated benchmark jobs run in parallel. Each target gets one ${BENCH_WARMUP_SECONDS}s warmup plus ${BENCH_RUNS} measured wrk runs, and the published Requests/sec is the median run with its matching latency. merjs uses upstream release tag \`$MERJS_BASELINE_REF\`; Linux CI switches to its shipped threaded runtime fallback because the default io_uring path currently fails to compile under ubuntu-latest." >> $GITHUB_STEP_SUMMARY
 
       - name: Fail if any benchmark job failed
-        if: ${{ needs.benchmark_zgix.result != 'success' || needs.benchmark_merjs.result != 'success' || needs.benchmark_nextjs.result != 'success' }}
+        if: ${{ needs.benchmark_zono.result != 'success' || needs.benchmark_merjs.result != 'success' || needs.benchmark_nextjs.result != 'success' }}
         run: |
           echo "::error::One or more benchmark jobs failed; README and benchmarks/latest.json were not updated."
           exit 1
@@ -513,19 +536,24 @@ jobs:
                   "aggregation": "median_requests_per_sec_with_matching_latency",
               },
               "target": {
-                  "zgix_route": "/api/json",
+                  "zono_route": "/api/json",
+                  "zono_context_route": "/api/context-json",
                   "merjs_route": "/api/json",
                   "nextjs_route": "/api/json",
                   "example": "benchmark",
               },
-              "zgix": {
-                  "requests_per_sec": float(os.environ["ZGIX_RPS"]),
-                  "avg_latency_ms": os.environ["ZGIX_LAT"],
-                  "ram_mb": float(os.environ["ZGIX_RAM_MB"]),
-                  "binary_size": os.environ["ZGIX_BINARY_SIZE"],
-                  "binary_bytes": int(os.environ["ZGIX_BINARY_BYTES"]),
-                  "source_files": int(os.environ["ZGIX_SOURCE_FILES"]),
-                  "zig_version": os.environ["ZGIX_ZIG_VERSION"],
+              "zono": {
+                  "requests_per_sec": float(os.environ["ZONO_RPS"]),
+                  "avg_latency_ms": os.environ["ZONO_LAT"],
+                  "ram_mb": float(os.environ["ZONO_RAM_MB"]),
+                  "binary_size": os.environ["ZONO_BINARY_SIZE"],
+                  "binary_bytes": int(os.environ["ZONO_BINARY_BYTES"]),
+                  "source_files": int(os.environ["ZONO_SOURCE_FILES"]),
+                  "zig_version": os.environ["ZONO_ZIG_VERSION"],
+              },
+              "zono_context": {
+                  "requests_per_sec": float(os.environ["ZONO_CONTEXT_RPS"]),
+                  "avg_latency_ms": os.environ["ZONO_CONTEXT_LAT"],
               },
               "merjs": {
                   "requests_per_sec": float(os.environ["MERJS_RPS"]),
@@ -562,11 +590,13 @@ jobs:
           import re
 
           block = "\n".join([
-              "| Metric | **zgix** | **merjs** | **Next.js** |",
+              "| Metric | **zono** | **merjs** | **Next.js** |",
               "|--------|----------|-----------|-------------|",
-              f'| Requests/sec (wrk median) | **{os.environ["ZGIX_RPS"]}** | **{os.environ["MERJS_RPS"]}** | **{os.environ["NEXTJS_RPS"]}** |',
-              f'| Avg latency | **{os.environ["ZGIX_LAT"]}** | **{os.environ["MERJS_LAT"]}** | **{os.environ["NEXTJS_LAT"]}** |',
-              f'| RAM usage (under load) | **{os.environ["ZGIX_RAM_MB"]} MB** | **{os.environ["MERJS_RAM_MB"]} MB** | **{os.environ["NEXTJS_RAM_MB"]} MB** |',
+              f'| Requests/sec (wrk median) | **{os.environ["ZONO_RPS"]}** | **{os.environ["MERJS_RPS"]}** | **{os.environ["NEXTJS_RPS"]}** |',
+              f'| Requests/sec (context route) | **{os.environ["ZONO_CONTEXT_RPS"]}** | - | - |',
+              f'| Avg latency | **{os.environ["ZONO_LAT"]}** | **{os.environ["MERJS_LAT"]}** | **{os.environ["NEXTJS_LAT"]}** |',
+              f'| Avg latency (context route) | **{os.environ["ZONO_CONTEXT_LAT"]}** | - | - |',
+              f'| RAM usage (under load) | **{os.environ["ZONO_RAM_MB"]} MB** | **{os.environ["MERJS_RAM_MB"]} MB** | **{os.environ["NEXTJS_RAM_MB"]} MB** |',
           ])
 
           with open("README.md", "r", encoding="utf-8") as fh:

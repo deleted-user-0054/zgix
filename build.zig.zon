@@ -1,7 +1,7 @@
 .{
-    .name = .zgix,
+    .name = .zono,
     .version = "0.1.0",
-    .fingerprint = 0x82bf6ba1581a8d44,
+    .fingerprint = 0x403e291931e352e8,
     .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",

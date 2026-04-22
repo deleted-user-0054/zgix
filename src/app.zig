@@ -4,6 +4,8 @@ const Response = @import("response.zig").Response;
 const response_mod = @import("response.zig");
 const path_mod = @import("path.zig");
 const router_mod = @import("router.zig");
+const context_mod = @import("context.zig");
+const Context = context_mod.Context;
 const Route = router_mod.Route;
 const Router = router_mod.Router;
 const Handler = router_mod.Handler;
@@ -64,6 +66,9 @@ pub const App = struct {
     handle_method_not_allowed: bool = true,
     handle_options: bool = true,
     not_found_handler: ?Handler = null,
+    has_context_handlers: bool = false,
+    has_context_middlewares: bool = false,
+    has_context_not_found: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) App {
         return initWithOptions(allocator, .{});
@@ -98,43 +103,43 @@ pub const App = struct {
         self.* = undefined;
     }
 
-    pub fn get(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn get(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.GET, path, handler);
     }
 
-    pub fn head(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn head(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.HEAD, path, handler);
     }
 
-    pub fn options(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn options(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.OPTIONS, path, handler);
     }
 
-    pub fn post(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn post(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.POST, path, handler);
     }
 
-    pub fn put(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn put(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.PUT, path, handler);
     }
 
-    pub fn patch(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn patch(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.PATCH, path, handler);
     }
 
-    pub fn delete(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn delete(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.DELETE, path, handler);
     }
 
-    pub fn connect(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn connect(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.CONNECT, path, handler);
     }
 
-    pub fn trace(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn trace(self: *App, path: []const u8, handler: anytype) !void {
         try self.addRoute(.TRACE, path, handler);
     }
 
-    pub fn all(self: *App, path: []const u8, handler: Handler) !void {
+    pub fn all(self: *App, path: []const u8, handler: anytype) !void {
         const methods = [_]std.http.Method{
             .GET,
             .HEAD,
@@ -152,7 +157,7 @@ pub const App = struct {
         }
     }
 
-    pub fn on(self: *App, methods: anytype, paths: anytype, handler: Handler) !void {
+    pub fn on(self: *App, methods: anytype, paths: anytype, handler: anytype) !void {
         try self.registerOn(methods, paths, handler);
     }
 
@@ -216,6 +221,9 @@ pub const App = struct {
                 .handler = nested.handler,
             });
         }
+
+        self.has_context_handlers = self.has_context_handlers or other.has_context_handlers;
+        self.has_context_middlewares = self.has_context_middlewares or other.has_context_middlewares;
     }
 
     pub fn mount(self: *App, prefix: []const u8, target: anytype) !void {
@@ -233,12 +241,15 @@ pub const App = struct {
         });
     }
 
-    pub fn notFound(self: *App, handler: Handler) void {
-        self.not_found_handler = handler;
+    pub fn notFound(self: *App, handler: anytype) void {
+        const resolved = resolveHandler(handler);
+        self.not_found_handler = resolved.handler;
+        self.has_context_not_found = resolved.uses_context;
     }
 
-    pub fn addRoute(self: *App, method: std.http.Method, path: []const u8, handler: Handler) !void {
+    pub fn addRoute(self: *App, method: std.http.Method, path: []const u8, handler: anytype) !void {
         if (self.finalized) return error.AppFinalized;
+        const resolved = resolveHandler(handler);
         const joined_path = try joinPrefixedPath(self.allocator, self.base_path, path);
         const full_path = try canonicalizeOwnedPath(self.allocator, joined_path, self.strict);
         errdefer self.allocator.free(full_path);
@@ -246,8 +257,9 @@ pub const App = struct {
         try self.routes.append(self.allocator, .{
             .method = method,
             .path = full_path,
-            .handler = handler,
+            .handler = resolved.handler,
         });
+        self.has_context_handlers = self.has_context_handlers or resolved.uses_context;
     }
 
     pub fn addMiddleware(self: *App, path: []const u8, middleware: anytype) !void {
@@ -256,10 +268,13 @@ pub const App = struct {
         const scoped_prefix = try scopedMiddlewarePrefix(self.allocator, self.base_path, path);
         errdefer self.allocator.free(scoped_prefix);
 
+        const resolved = resolveMiddlewareHandler(middleware);
+
         try self.middlewares.append(self.allocator, .{
             .prefix = scoped_prefix,
-            .handler = resolveMiddlewareHandler(middleware),
+            .handler = resolved.handler,
         });
+        self.has_context_middlewares = self.has_context_middlewares or resolved.uses_context;
     }
 
     pub fn finalize(self: *App) !void {
@@ -270,8 +285,19 @@ pub const App = struct {
 
     pub fn handle(self: *App, req: Request) Response {
         if (!self.finalized) self.finalize() catch return response_mod.internalError("router init failed");
-        if (self.middlewares.items.len == 0) return self.handleEndpoint(req);
-        return self.runMiddlewares(req, 0);
+        if (!self.usesContext()) {
+            if (self.middlewares.items.len == 0) return self.handleEndpoint(req);
+            return self.runMiddlewares(req, 0);
+        }
+
+        var handled_req = req;
+        var shared_state = context_mod.SharedState.init(handled_req.allocator);
+        const owns_context_state = handled_req.context_state == null;
+        if (owns_context_state) handled_req.context_state = @ptrCast(&shared_state);
+        defer if (owns_context_state) shared_state.deinit();
+
+        if (self.middlewares.items.len == 0) return self.handleEndpoint(handled_req);
+        return self.runMiddlewares(handled_req, 0);
     }
 
     fn runMiddlewares(self: *App, req: Request, start_index: usize) Response {
@@ -358,7 +384,7 @@ pub const App = struct {
             return try self.cloneHandledResponse(allocator, input.*);
         }
         if (!comptime isStringLike(InputType)) {
-            @compileError("App.request input must be a zgix.Request, *zgix.Request, or a string-like target.");
+            @compileError("App.request input must be a zono.Request, *zono.Request, or a string-like target.");
         }
 
         const target: []const u8 = input;
@@ -389,7 +415,7 @@ pub const App = struct {
         return try response.clone(allocator);
     }
 
-    fn registerOn(self: *App, methods: anytype, paths: anytype, handler: Handler) !void {
+    fn registerOn(self: *App, methods: anytype, paths: anytype, handler: anytype) !void {
         const MethodsType = @TypeOf(methods);
         if (MethodsType == std.http.Method) {
             try self.registerPaths(methods, paths, handler);
@@ -430,7 +456,7 @@ pub const App = struct {
         }
     }
 
-    fn registerPaths(self: *App, method: std.http.Method, paths: anytype, handler: Handler) !void {
+    fn registerPaths(self: *App, method: std.http.Method, paths: anytype, handler: anytype) !void {
         const PathsType = @TypeOf(paths);
         if (comptime isStringLike(PathsType)) {
             const path_slice: []const u8 = paths;
@@ -482,6 +508,10 @@ pub const App = struct {
         }
         self.base_path = "";
         self.base_path_owned = null;
+    }
+
+    fn usesContext(self: *const App) bool {
+        return self.has_context_handlers or self.has_context_middlewares or self.has_context_not_found;
     }
 };
 
@@ -617,27 +647,153 @@ fn resolveMountTarget(target: anytype) App.MountTarget {
     if (TargetType == Handler) return .{ .handler = target };
 
     return switch (comptime @typeInfo(TargetType)) {
-        .@"fn" => .{ .handler = target },
+        .@"fn" => .{ .handler = resolveHandler(target).handler },
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
-            .@"fn" => .{ .handler = target },
-            else => @compileError("App.mount target must be a *zgix.App or a compatible handler."),
+            .@"fn" => .{ .handler = resolveHandler(target).handler },
+            else => @compileError("App.mount target must be a *zono.App or a compatible handler."),
         },
-        else => @compileError("App.mount target must be a *zgix.App or a compatible handler."),
+        else => @compileError("App.mount target must be a *zono.App or a compatible handler."),
     };
 }
 
-fn resolveMiddlewareHandler(target: anytype) App.Middleware {
+const ResolvedHandler = struct {
+    handler: Handler,
+    uses_context: bool,
+};
+
+const ResolvedMiddleware = struct {
+    handler: App.Middleware,
+    uses_context: bool,
+};
+
+fn resolveHandler(target: anytype) ResolvedHandler {
     const TargetType = @TypeOf(target);
-    if (TargetType == App.Middleware) return target;
+    if (TargetType == Handler) {
+        return .{
+            .handler = target,
+            .uses_context = false,
+        };
+    }
 
     return switch (comptime @typeInfo(TargetType)) {
-        .@"fn" => target,
+        .@"fn" => resolveHandlerFn(target, TargetType),
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
-            .@"fn" => target,
-            else => @compileError("App.use middleware must be a compatible middleware handler."),
+            .@"fn" => resolveHandlerFn(target, pointer.child),
+            else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response or fn(c: *zono.Context) zono.Response."),
         },
-        else => @compileError("App.use middleware must be a compatible middleware handler."),
+        else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response or fn(c: *zono.Context) zono.Response."),
     };
+}
+
+fn resolveHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedHandler {
+    const info = @typeInfo(FnType).@"fn";
+    if (info.return_type == null or info.return_type.? != Response) {
+        @compileError("Route handlers must return zono.Response.");
+    }
+    if (info.params.len != 1 or info.params[0].type == null) {
+        @compileError("Route handlers must accept exactly one parameter.");
+    }
+
+    const ParamType = info.params[0].type.?;
+    if (ParamType == Request) {
+        return .{
+            .handler = target,
+            .uses_context = false,
+        };
+    }
+    if (ParamType == *Context) {
+        return .{
+            .handler = wrapContextHandler(target),
+            .uses_context = true,
+        };
+    }
+
+    @compileError("Route handlers must be fn(req: zono.Request) zono.Response or fn(c: *zono.Context) zono.Response.");
+}
+
+fn resolveMiddlewareHandler(target: anytype) ResolvedMiddleware {
+    const TargetType = @TypeOf(target);
+    if (TargetType == App.Middleware) {
+        return .{
+            .handler = target,
+            .uses_context = false,
+        };
+    }
+
+    return switch (comptime @typeInfo(TargetType)) {
+        .@"fn" => resolveMiddlewareFn(target, TargetType),
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"fn" => resolveMiddlewareFn(target, pointer.child),
+            else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) zono.Response."),
+        },
+        else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) zono.Response."),
+    };
+}
+
+fn resolveMiddlewareFn(comptime target: anytype, comptime FnType: type) ResolvedMiddleware {
+    const info = @typeInfo(FnType).@"fn";
+    if (info.return_type == null or info.return_type.? != Response) {
+        @compileError("Middleware handlers must return zono.Response.");
+    }
+    if (info.params.len != 2 or info.params[0].type == null or info.params[1].type == null) {
+        @compileError("Middleware handlers must accept exactly two parameters.");
+    }
+
+    const FirstParam = info.params[0].type.?;
+    const SecondParam = info.params[1].type.?;
+    if (FirstParam == Request and SecondParam == App.Next) {
+        return .{
+            .handler = target,
+            .uses_context = false,
+        };
+    }
+    if (FirstParam == *Context and SecondParam == Context.Next) {
+        return .{
+            .handler = wrapContextMiddleware(target),
+            .uses_context = true,
+        };
+    }
+
+    @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) zono.Response.");
+}
+
+fn wrapContextHandler(comptime target: anytype) Handler {
+    return struct {
+        fn run(req: Request) Response {
+            var local_state = context_mod.SharedState.init(req.allocator);
+            var ctx_req = req;
+            const owns_context_state = ctx_req.context_state == null;
+            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
+            defer if (owns_context_state) local_state.deinit();
+
+            var ctx = Context.init(ctx_req);
+            return target(&ctx);
+        }
+    }.run;
+}
+
+fn wrapContextMiddleware(comptime target: anytype) App.Middleware {
+    return struct {
+        fn run(req: Request, next: App.Next) Response {
+            var local_state = context_mod.SharedState.init(req.allocator);
+            var ctx_req = req;
+            const owns_context_state = ctx_req.context_state == null;
+            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
+            defer if (owns_context_state) local_state.deinit();
+
+            var ctx = Context.init(ctx_req);
+            return target(&ctx, .{
+                .ctx = &ctx,
+                .next_ctx = &next,
+                .run_fn = runContextMiddlewareNext,
+            });
+        }
+    }.run;
+}
+
+fn runContextMiddlewareNext(next_ctx: *const anyopaque, req: Request) Response {
+    const next: *const App.Next = @ptrCast(@alignCast(next_ctx));
+    return next.run(req);
 }
 
 fn dispatchMount(target: App.MountTarget, req: Request) Response {
@@ -999,6 +1155,81 @@ test "app route carries sub-app middleware" {
     try std.testing.expectEqualStrings("/api/hello", responseHeaderValue(res, "x-child").?);
 }
 
+test "app context handlers can build responses" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/ctx", struct {
+        fn run(c: *Context) Response {
+            c.status(.created);
+            _ = c.header("x-handler", "context");
+            return c.text("hello");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
+    try std.testing.expectEqual(std.http.Status.created, res.status);
+    try std.testing.expectEqualStrings("hello", res.body);
+    try std.testing.expectEqualStrings("context", responseHeaderValue(res, "x-handler").?);
+}
+
+test "app context middleware preserves pre-next headers" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            _ = c.header("x-before", "1");
+            next.run();
+            _ = c.res.header("x-after", "1");
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/ctx", struct {
+        fn run(c: *Context) Response {
+            return c.text("ok");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("ok", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-before").?);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-after").?);
+}
+
+test "app context middleware can set values for context handlers" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.set("message", "hello from context") catch return response_mod.internalError("set failed");
+            c.set("status_code", std.http.Status.accepted) catch return response_mod.internalError("set failed");
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/ctx", struct {
+        fn run(c: *Context) Response {
+            const message = c.get([]const u8, "message") orelse return response_mod.internalError("missing message");
+            const status_code = c.get(std.http.Status, "status_code") orelse return response_mod.internalError("missing status");
+            c.status(status_code);
+            return c.text(message);
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
+    try std.testing.expectEqual(std.http.Status.accepted, res.status);
+    try std.testing.expectEqualStrings("hello from context", res.body);
+}
+
 test "app mount delegates prefixed requests to mounted apps" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -1104,6 +1335,26 @@ test "app custom notFound handler overrides default miss response" {
     try std.testing.expectEqualStrings("/missing", res.body);
 }
 
+test "app custom notFound handler accepts context handlers" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.notFound(struct {
+        fn run(c: *Context) Response {
+            c.status(.not_found);
+            _ = c.header("x-miss", "1");
+            return c.text(c.req.path);
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/missing"));
+    try std.testing.expectEqual(std.http.Status.not_found, res.status);
+    try std.testing.expectEqualStrings("/missing", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-miss").?);
+}
+
 test "app request helper dispatches with query headers and body" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -1138,14 +1389,14 @@ test "app request helper accepts absolute urls" {
         }
     }.run);
 
-    var res = try app.request(std.testing.allocator, "https://example.com/hello?name=zgix", .{});
+    var res = try app.request(std.testing.allocator, "https://example.com/hello?name=zono", .{});
     defer res.deinit();
 
     try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("zgix", res.body);
+    try std.testing.expectEqualStrings("zono", res.body);
 }
 
-test "app request helper accepts zgix request values" {
+test "app request helper accepts zono request values" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
 

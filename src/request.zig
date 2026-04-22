@@ -281,6 +281,7 @@ pub const Request = struct {
     header_lookup_fn: ?HeaderLookupFn = null,
     headers_collect_fn: ?HeadersCollectFn = null,
     params: []const Param = &.{},
+    context_state: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator, method: std.http.Method, path: []const u8) Request {
         return .{
@@ -288,6 +289,10 @@ pub const Request = struct {
             .method = method,
             .path = path,
         };
+    }
+
+    pub fn contextState(self: Request) ?*anyopaque {
+        return self.context_state;
     }
 
     pub fn param(self: Request, name: []const u8) ?[]const u8 {
@@ -1372,19 +1377,19 @@ test "request parseBody rejects unsupported content types" {
 test "request parseBody parses multipart text fields" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
     parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
     };
     parsed_req.body =
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"title\"\r\n\r\n" ++
         "hello world\r\n" ++
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"tag[]\"\r\n\r\n" ++
         "zig\r\n" ++
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"tag[]\"\r\n\r\n" ++
         "router\r\n" ++
-        "--zgix-boundary--\r\n";
+        "--zono-boundary--\r\n";
 
     var body = try parsed_req.parseBody(.{});
     defer body.deinit();
@@ -1399,16 +1404,16 @@ test "request parseBody parses multipart text fields" {
 test "request parseBody multipart all collects repeated fields" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
     parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=\"zgix-boundary\"" },
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=\"zono-boundary\"" },
     };
     parsed_req.body =
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"tag\"\r\n\r\n" ++
         "zig\r\n" ++
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"tag\"\r\n\r\n" ++
         "web toolkit\r\n" ++
-        "--zgix-boundary--\r\n";
+        "--zono-boundary--\r\n";
 
     var body = try parsed_req.parseBody(.{
         .all = true,
@@ -1424,17 +1429,17 @@ test "request parseBody multipart all collects repeated fields" {
 test "request parseMultipart returns text fields and files" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
     parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
     };
     parsed_req.body =
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"title\"\r\n\r\n" ++
         "hello world\r\n" ++
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.txt\"\r\n" ++
         "Content-Type: text/plain\r\n\r\n" ++
         "hello\r\n" ++
-        "--zgix-boundary--\r\n";
+        "--zono-boundary--\r\n";
 
     var multipart = try parsed_req.parseMultipart(.{});
     defer multipart.deinit();
@@ -1450,16 +1455,16 @@ test "request parseMultipart returns text fields and files" {
 test "request parseMultipart collects repeated files" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
     parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
     };
     parsed_req.body =
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"photos[]\"; filename=\"a.txt\"\r\n\r\n" ++
         "A\r\n" ++
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"photos[]\"; filename=\"b.txt\"\r\n\r\n" ++
         "B\r\n" ++
-        "--zgix-boundary--\r\n";
+        "--zono-boundary--\r\n";
 
     var multipart = try parsed_req.parseMultipart(.{});
     defer multipart.deinit();
@@ -1476,17 +1481,17 @@ test "request parseMultipart collects repeated files" {
 test "request parseBody multipart returns files directly" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
     parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
     };
     parsed_req.body =
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"title\"\r\n\r\n" ++
         "hello world\r\n" ++
-        "--zgix-boundary\r\n" ++
+        "--zono-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.txt\"\r\n" ++
         "Content-Type: text/plain\r\n\r\n" ++
         "hello\r\n" ++
-        "--zgix-boundary--\r\n";
+        "--zono-boundary--\r\n";
 
     var body = try parsed_req.parseBody(.{});
     defer body.deinit();

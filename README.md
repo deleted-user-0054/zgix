@@ -11,7 +11,7 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zgix.Server`
 - Request helpers for params, query strings, headers, cookies, and typed JSON parsing
-- `application/x-www-form-urlencoded` parsing, `Request.parseBody()`, `Response.cookie()`, and a low-level `zgix.body()` response helper
+- `application/x-www-form-urlencoded` parsing, text-only `multipart/form-data` `Request.parseBody()`, `Response.cookie()`, and a low-level `zgix.body()` response helper
 - `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start

@@ -9,6 +9,7 @@ const Context = context_mod.Context;
 const Route = router_mod.Route;
 const Router = router_mod.Router;
 const Handler = router_mod.Handler;
+const ErrorHandler = *const fn (err: anyerror, req: Request) Response;
 
 pub const App = struct {
     const Self = @This();
@@ -66,9 +67,12 @@ pub const App = struct {
     handle_method_not_allowed: bool = true,
     handle_options: bool = true,
     not_found_handler: ?Handler = null,
+    on_error_handler: ?ErrorHandler = null,
     has_context_handlers: bool = false,
     has_context_middlewares: bool = false,
     has_context_not_found: bool = false,
+    has_error_handlers: bool = false,
+    has_error_middlewares: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) App {
         return initWithOptions(allocator, .{});
@@ -224,6 +228,8 @@ pub const App = struct {
 
         self.has_context_handlers = self.has_context_handlers or other.has_context_handlers;
         self.has_context_middlewares = self.has_context_middlewares or other.has_context_middlewares;
+        self.has_error_handlers = self.has_error_handlers or other.has_error_handlers;
+        self.has_error_middlewares = self.has_error_middlewares or other.has_error_middlewares;
     }
 
     pub fn mount(self: *App, prefix: []const u8, target: anytype) !void {
@@ -235,16 +241,24 @@ pub const App = struct {
         const mounted_prefix = try normalizePrefix(self.allocator, combined_prefix);
         errdefer self.allocator.free(mounted_prefix);
 
+        const resolved = resolveMountTarget(target);
         try self.mounts.append(self.allocator, .{
             .prefix = mounted_prefix,
-            .target = resolveMountTarget(target),
+            .target = resolved.target,
         });
+        self.has_context_handlers = self.has_context_handlers or resolved.uses_context;
+        self.has_error_handlers = self.has_error_handlers or resolved.uses_error;
     }
 
     pub fn notFound(self: *App, handler: anytype) void {
         const resolved = resolveHandler(handler);
         self.not_found_handler = resolved.handler;
         self.has_context_not_found = resolved.uses_context;
+    }
+
+    pub fn onError(self: *App, handler: anytype) void {
+        const resolved = resolveErrorHandler(handler);
+        self.on_error_handler = resolved.handler;
     }
 
     pub fn addRoute(self: *App, method: std.http.Method, path: []const u8, handler: anytype) !void {
@@ -260,6 +274,7 @@ pub const App = struct {
             .handler = resolved.handler,
         });
         self.has_context_handlers = self.has_context_handlers or resolved.uses_context;
+        self.has_error_handlers = self.has_error_handlers or resolved.uses_error;
     }
 
     pub fn addMiddleware(self: *App, path: []const u8, middleware: anytype) !void {
@@ -275,6 +290,7 @@ pub const App = struct {
             .handler = resolved.handler,
         });
         self.has_context_middlewares = self.has_context_middlewares or resolved.uses_context;
+        self.has_error_middlewares = self.has_error_middlewares or resolved.uses_error;
     }
 
     pub fn finalize(self: *App) !void {
@@ -285,7 +301,7 @@ pub const App = struct {
 
     pub fn handle(self: *App, req: Request) Response {
         if (!self.finalized) self.finalize() catch return response_mod.internalError("router init failed");
-        if (!self.usesContext()) {
+        if (!self.usesSharedState()) {
             if (self.middlewares.items.len == 0) return self.handleEndpoint(req);
             return self.runMiddlewares(req, 0);
         }
@@ -298,8 +314,11 @@ pub const App = struct {
             break :blk &shared_state;
         } else @ptrCast(@alignCast(handled_req.context_state.?));
         const previous_not_found_handler = state.not_found_handler;
+        const previous_on_error_handler = state.on_error_handler;
         state.not_found_handler = self.not_found_handler;
+        state.on_error_handler = self.on_error_handler;
         defer state.not_found_handler = previous_not_found_handler;
+        defer state.on_error_handler = previous_on_error_handler;
         defer if (owns_context_state) shared_state.deinit();
 
         if (self.middlewares.items.len == 0) return self.handleEndpoint(handled_req);
@@ -516,8 +535,12 @@ pub const App = struct {
         self.base_path_owned = null;
     }
 
-    fn usesContext(self: *const App) bool {
-        return self.has_context_handlers or self.has_context_middlewares or self.has_context_not_found;
+    fn usesSharedState(self: *const App) bool {
+        return self.has_context_handlers or
+            self.has_context_middlewares or
+            self.has_context_not_found or
+            self.has_error_handlers or
+            self.has_error_middlewares;
     }
 };
 
@@ -646,16 +669,36 @@ fn canonicalizeOwnedPath(allocator: std.mem.Allocator, path: []const u8, strict:
     return owned;
 }
 
-fn resolveMountTarget(target: anytype) App.MountTarget {
+const ResolvedMountTarget = struct {
+    target: App.MountTarget,
+    uses_context: bool = false,
+    uses_error: bool = false,
+};
+
+fn resolveMountTarget(target: anytype) ResolvedMountTarget {
     const TargetType = @TypeOf(target);
-    if (TargetType == *App) return .{ .app = target };
-    if (TargetType == *const App) return .{ .app = @constCast(target) };
-    if (TargetType == Handler) return .{ .handler = target };
+    if (TargetType == *App) return .{ .target = .{ .app = target } };
+    if (TargetType == *const App) return .{ .target = .{ .app = @constCast(target) } };
+    if (TargetType == Handler) return .{ .target = .{ .handler = target } };
 
     return switch (comptime @typeInfo(TargetType)) {
-        .@"fn" => .{ .handler = resolveHandler(target).handler },
+        .@"fn" => blk: {
+            const resolved = resolveHandler(target);
+            break :blk .{
+                .target = .{ .handler = resolved.handler },
+                .uses_context = resolved.uses_context,
+                .uses_error = resolved.uses_error,
+            };
+        },
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
-            .@"fn" => .{ .handler = resolveHandler(target).handler },
+            .@"fn" => blk: {
+                const resolved = resolveHandler(target);
+                break :blk .{
+                    .target = .{ .handler = resolved.handler },
+                    .uses_context = resolved.uses_context,
+                    .uses_error = resolved.uses_error,
+                };
+            },
             else => @compileError("App.mount target must be a *zono.App or a compatible handler."),
         },
         else => @compileError("App.mount target must be a *zono.App or a compatible handler."),
@@ -665,11 +708,17 @@ fn resolveMountTarget(target: anytype) App.MountTarget {
 const ResolvedHandler = struct {
     handler: Handler,
     uses_context: bool,
+    uses_error: bool,
 };
 
 const ResolvedMiddleware = struct {
     handler: App.Middleware,
     uses_context: bool,
+    uses_error: bool,
+};
+
+const ResolvedErrorHandler = struct {
+    handler: ErrorHandler,
 };
 
 fn resolveHandler(target: anytype) ResolvedHandler {
@@ -678,43 +727,95 @@ fn resolveHandler(target: anytype) ResolvedHandler {
         return .{
             .handler = target,
             .uses_context = false,
+            .uses_error = false,
         };
     }
 
     return switch (comptime @typeInfo(TargetType)) {
+        .@"struct" => |struct_info| switch (struct_info.is_tuple) {
+            true => resolveHandlerChain(target, TargetType),
+            false => @compileError("Route handlers must be a compatible handler or a tuple like .{ middleware, handler }."),
+        },
         .@"fn" => resolveHandlerFn(target, TargetType),
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
             .@"fn" => resolveHandlerFn(target, pointer.child),
-            else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response or fn(c: *zono.Context) zono.Response."),
+            else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, or fn(c: *zono.Context) !zono.Response."),
         },
-        else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response or fn(c: *zono.Context) zono.Response."),
+        else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, fn(c: *zono.Context) !zono.Response, or a tuple like .{ middleware, handler }."),
     };
 }
 
 fn resolveHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedHandler {
     const info = @typeInfo(FnType).@"fn";
-    if (info.return_type == null or info.return_type.? != Response) {
-        @compileError("Route handlers must return zono.Response.");
-    }
+    const returns_error = comptime returnsErrorResponse(info.return_type, "Route handlers");
     if (info.params.len != 1 or info.params[0].type == null) {
         @compileError("Route handlers must accept exactly one parameter.");
     }
 
     const ParamType = info.params[0].type.?;
     if (ParamType == Request) {
+        if (returns_error) {
+            return .{
+                .handler = wrapErrorHandler(target),
+                .uses_context = false,
+                .uses_error = true,
+            };
+        }
         return .{
             .handler = target,
             .uses_context = false,
+            .uses_error = false,
         };
     }
     if (ParamType == *Context) {
+        if (returns_error) {
+            return .{
+                .handler = wrapContextErrorHandler(target),
+                .uses_context = true,
+                .uses_error = true,
+            };
+        }
         return .{
             .handler = wrapContextHandler(target),
             .uses_context = true,
+            .uses_error = false,
         };
     }
 
-    @compileError("Route handlers must be fn(req: zono.Request) zono.Response or fn(c: *zono.Context) zono.Response.");
+    @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, or fn(c: *zono.Context) !zono.Response.");
+}
+
+fn resolveHandlerChain(comptime target: anytype, comptime TargetType: type) ResolvedHandler {
+    const fields = std.meta.fields(TargetType);
+    if (fields.len == 0) {
+        @compileError("Route handler tuples must contain at least one handler.");
+    }
+
+    comptime var uses_context = false;
+    comptime var uses_error = false;
+
+    if (fields.len == 1) {
+        const resolved = resolveHandler(@field(target, fields[0].name));
+        return resolved;
+    }
+
+    comptime var middlewares: [fields.len - 1]App.Middleware = undefined;
+    inline for (fields[0 .. fields.len - 1], 0..) |field, index| {
+        const resolved = comptime resolveMiddlewareHandler(@field(target, field.name));
+        middlewares[index] = resolved.handler;
+        uses_context = uses_context or resolved.uses_context;
+        uses_error = uses_error or resolved.uses_error;
+    }
+
+    const final_resolved = comptime resolveHandler(@field(target, fields[fields.len - 1].name));
+    uses_context = uses_context or final_resolved.uses_context;
+    uses_error = uses_error or final_resolved.uses_error;
+
+    return .{
+        .handler = wrapRouteChain(middlewares, final_resolved.handler),
+        .uses_context = uses_context,
+        .uses_error = uses_error,
+    };
 }
 
 fn resolveMiddlewareHandler(target: anytype) ResolvedMiddleware {
@@ -723,6 +824,7 @@ fn resolveMiddlewareHandler(target: anytype) ResolvedMiddleware {
         return .{
             .handler = target,
             .uses_context = false,
+            .uses_error = false,
         };
     }
 
@@ -730,17 +832,15 @@ fn resolveMiddlewareHandler(target: anytype) ResolvedMiddleware {
         .@"fn" => resolveMiddlewareFn(target, TargetType),
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
             .@"fn" => resolveMiddlewareFn(target, pointer.child),
-            else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) zono.Response."),
+            else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response, fn(req: zono.Request, next: zono.App.Next) !zono.Response, fn(c: *zono.Context, next: zono.Context.Next) zono.Response, or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response."),
         },
-        else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) zono.Response."),
+        else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response, fn(req: zono.Request, next: zono.App.Next) !zono.Response, fn(c: *zono.Context, next: zono.Context.Next) zono.Response, or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response."),
     };
 }
 
 fn resolveMiddlewareFn(comptime target: anytype, comptime FnType: type) ResolvedMiddleware {
     const info = @typeInfo(FnType).@"fn";
-    if (info.return_type == null or info.return_type.? != Response) {
-        @compileError("Middleware handlers must return zono.Response.");
-    }
+    const returns_error = comptime returnsErrorResponse(info.return_type, "Middleware handlers");
     if (info.params.len != 2 or info.params[0].type == null or info.params[1].type == null) {
         @compileError("Middleware handlers must accept exactly two parameters.");
     }
@@ -748,19 +848,99 @@ fn resolveMiddlewareFn(comptime target: anytype, comptime FnType: type) Resolved
     const FirstParam = info.params[0].type.?;
     const SecondParam = info.params[1].type.?;
     if (FirstParam == Request and SecondParam == App.Next) {
+        if (returns_error) {
+            return .{
+                .handler = wrapErrorMiddleware(target),
+                .uses_context = false,
+                .uses_error = true,
+            };
+        }
         return .{
             .handler = target,
             .uses_context = false,
+            .uses_error = false,
         };
     }
     if (FirstParam == *Context and SecondParam == Context.Next) {
+        if (returns_error) {
+            return .{
+                .handler = wrapContextErrorMiddleware(target),
+                .uses_context = true,
+                .uses_error = true,
+            };
+        }
         return .{
             .handler = wrapContextMiddleware(target),
             .uses_context = true,
+            .uses_error = false,
         };
     }
 
-    @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) zono.Response.");
+    @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response, fn(req: zono.Request, next: zono.App.Next) !zono.Response, fn(c: *zono.Context, next: zono.Context.Next) zono.Response, or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response.");
+}
+
+fn resolveErrorHandler(target: anytype) ResolvedErrorHandler {
+    const TargetType = @TypeOf(target);
+    if (TargetType == ErrorHandler) {
+        return .{
+            .handler = target,
+        };
+    }
+
+    return switch (comptime @typeInfo(TargetType)) {
+        .@"fn" => resolveErrorHandlerFn(target, TargetType),
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"fn" => resolveErrorHandlerFn(target, pointer.child),
+            else => @compileError("App.onError handlers must be fn(err: anyerror, req: zono.Request) zono.Response or fn(err: anyerror, c: *zono.Context) zono.Response."),
+        },
+        else => @compileError("App.onError handlers must be fn(err: anyerror, req: zono.Request) zono.Response or fn(err: anyerror, c: *zono.Context) zono.Response."),
+    };
+}
+
+fn resolveErrorHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedErrorHandler {
+    const info = @typeInfo(FnType).@"fn";
+    if (info.return_type == null or info.return_type.? != Response) {
+        @compileError("App.onError handlers must return zono.Response.");
+    }
+    if (info.params.len != 2 or info.params[0].type == null or info.params[1].type == null) {
+        @compileError("App.onError handlers must accept exactly two parameters.");
+    }
+    if (info.params[0].type.? != anyerror) {
+        @compileError("App.onError handlers must accept err: anyerror as the first parameter.");
+    }
+
+    const ParamType = info.params[1].type.?;
+    if (ParamType == Request) {
+        return .{
+            .handler = target,
+        };
+    }
+    if (ParamType == *Context) {
+        return .{
+            .handler = wrapContextErrorResponder(target),
+        };
+    }
+
+    @compileError("App.onError handlers must be fn(err: anyerror, req: zono.Request) zono.Response or fn(err: anyerror, c: *zono.Context) zono.Response.");
+}
+
+fn returnsErrorResponse(comptime return_type: ?type, comptime owner: []const u8) bool {
+    if (return_type == null) {
+        @compileError(owner ++ " must return zono.Response or !zono.Response.");
+    }
+
+    const ReturnType = return_type.?;
+    if (ReturnType == Response) return false;
+
+    return switch (@typeInfo(ReturnType)) {
+        .error_union => |error_union| blk: {
+            if (error_union.payload != Response) {
+                @compileError(owner ++ " must return zono.Response or !zono.Response.");
+            }
+            break :blk true;
+        },
+        else => @compileError(owner ++ " must return zono.Response or !zono.Response."),
+    };
 }
 
 fn wrapContextHandler(comptime target: anytype) Handler {
@@ -774,6 +954,29 @@ fn wrapContextHandler(comptime target: anytype) Handler {
 
             var ctx = Context.init(ctx_req);
             return target(&ctx);
+        }
+    }.run;
+}
+
+fn wrapErrorHandler(comptime target: anytype) Handler {
+    return struct {
+        fn run(req: Request) Response {
+            return target(req) catch |err| dispatchHandlerError(req, err);
+        }
+    }.run;
+}
+
+fn wrapContextErrorHandler(comptime target: anytype) Handler {
+    return struct {
+        fn run(req: Request) Response {
+            var local_state = context_mod.SharedState.init(req.allocator);
+            var ctx_req = req;
+            const owns_context_state = ctx_req.context_state == null;
+            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
+            defer if (owns_context_state) local_state.deinit();
+
+            var ctx = Context.init(ctx_req);
+            return target(&ctx) catch |err| dispatchHandlerError(ctx_req, err);
         }
     }.run;
 }
@@ -797,9 +1000,102 @@ fn wrapContextMiddleware(comptime target: anytype) App.Middleware {
     }.run;
 }
 
+fn wrapErrorMiddleware(comptime target: anytype) App.Middleware {
+    return struct {
+        fn run(req: Request, next: App.Next) Response {
+            return target(req, next) catch |err| dispatchHandlerError(req, err);
+        }
+    }.run;
+}
+
+fn wrapContextErrorMiddleware(comptime target: anytype) App.Middleware {
+    return struct {
+        fn run(req: Request, next: App.Next) Response {
+            var local_state = context_mod.SharedState.init(req.allocator);
+            var ctx_req = req;
+            const owns_context_state = ctx_req.context_state == null;
+            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
+            defer if (owns_context_state) local_state.deinit();
+
+            var ctx = Context.init(ctx_req);
+            return target(&ctx, .{
+                .ctx = &ctx,
+                .next_ctx = &next,
+                .run_fn = runContextMiddlewareNext,
+            }) catch |err| dispatchHandlerError(ctx_req, err);
+        }
+    }.run;
+}
+
+fn wrapContextErrorResponder(comptime target: anytype) ErrorHandler {
+    return struct {
+        fn run(err: anyerror, req: Request) Response {
+            var local_state = context_mod.SharedState.init(req.allocator);
+            var ctx_req = req;
+            const owns_context_state = ctx_req.context_state == null;
+            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
+            defer if (owns_context_state) local_state.deinit();
+
+            if (ctx_req.context_state) |raw_state| {
+                const state: *context_mod.SharedState = @ptrCast(@alignCast(raw_state));
+                state.last_error = err;
+            }
+
+            var ctx = Context.init(ctx_req);
+            return target(err, &ctx);
+        }
+    }.run;
+}
+
 fn runContextMiddlewareNext(next_ctx: *const anyopaque, req: Request) Response {
     const next: *const App.Next = @ptrCast(@alignCast(next_ctx));
     return next.run(req);
+}
+
+fn dispatchHandlerError(req: Request, err: anyerror) Response {
+    if (req.context_state) |raw_state| {
+        const state: *context_mod.SharedState = @ptrCast(@alignCast(raw_state));
+        state.last_error = err;
+        if (state.on_error_handler) |handler| {
+            return handler(err, req);
+        }
+    }
+
+    return response_mod.text(.internal_server_error, "Internal Server Error");
+}
+
+fn wrapRouteChain(comptime middlewares: anytype, comptime final_handler: Handler) Handler {
+    return struct {
+        const chain_middlewares = middlewares;
+        const chain_final_handler = final_handler;
+
+        const Frame = struct {
+            next_index: usize,
+        };
+
+        fn run(req: Request) Response {
+            return runFrom(req, 0);
+        }
+
+        fn runFrom(req: Request, index: usize) Response {
+            if (index >= chain_middlewares.len) {
+                return chain_final_handler(req);
+            }
+
+            const frame = Frame{
+                .next_index = index + 1,
+            };
+            return chain_middlewares[index](req, .{
+                .ctx = &frame,
+                .run_fn = runNext,
+            });
+        }
+
+        fn runNext(ctx: *const anyopaque, req: Request) Response {
+            const frame: *const Frame = @ptrCast(@alignCast(ctx));
+            return runFrom(req, frame.next_index);
+        }
+    }.run;
 }
 
 fn dispatchMount(target: App.MountTarget, req: Request) Response {
@@ -1306,6 +1602,181 @@ test "app context notFound uses custom app notFound handler" {
     try std.testing.expectEqual(std.http.Status.not_found, res.status);
     try std.testing.expectEqualStrings("/ctx-miss", res.body);
     try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-before").?);
+}
+
+test "app onError handles request handler errors" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.onError(struct {
+        fn run(err: anyerror, req: Request) Response {
+            if (err == error.Boom) {
+                return response_mod.text(.bad_request, req.path);
+            }
+            return response_mod.text(.internal_server_error, "unexpected");
+        }
+    }.run);
+    try app.get("/boom", struct {
+        fn run(_: Request) !Response {
+            return error.Boom;
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/boom"));
+    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
+    try std.testing.expectEqualStrings("/boom", res.body);
+}
+
+test "app onError handles context handler errors" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.onError(struct {
+        fn run(err: anyerror, c: *Context) Response {
+            c.status(if (err == error.Forbidden) .forbidden else .internal_server_error);
+            _ = c.header("x-error", @errorName(err));
+            return c.text(c.req.path);
+        }
+    }.run);
+    try app.get("/ctx-boom", struct {
+        fn run(c: *Context) !Response {
+            _ = c.header("x-before", "1");
+            return error.Forbidden;
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-boom"));
+    try std.testing.expectEqual(std.http.Status.forbidden, res.status);
+    try std.testing.expectEqualStrings("/ctx-boom", res.body);
+    try std.testing.expectEqualStrings("Forbidden", responseHeaderValue(res, "x-error").?);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-before").?);
+}
+
+test "app context middleware can inspect c.err after next.run" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.onError(struct {
+        fn run(err: anyerror, c: *Context) Response {
+            c.status(.bad_request);
+            return c.text(@errorName(err));
+        }
+    }.run);
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            next.run();
+            if (c.err != null) {
+                _ = c.header("x-error-seen", "1");
+            }
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/ctx-error", struct {
+        fn run(_: Request) !Response {
+            return error.Boom;
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-error"));
+    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
+    try std.testing.expectEqualStrings("Boom", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-error-seen").?);
+}
+
+test "app route tuples support route-level middleware" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/tuple", .{
+        struct {
+            fn run(req: Request, next: App.Next) Response {
+                var res = next.run(req);
+                _ = res.header("x-route", req.path);
+                return res;
+            }
+        }.run,
+        struct {
+            fn run(_: Request) Response {
+                return response_mod.text(.ok, "tuple");
+            }
+        }.run,
+    });
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/tuple"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("tuple", res.body);
+    try std.testing.expectEqualStrings("/tuple", responseHeaderValue(res, "x-route").?);
+}
+
+test "app route tuples support context middleware and handlers" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/tuple-ctx", .{
+        struct {
+            fn run(c: *Context, next: Context.Next) Response {
+                c.set("message", "from tuple") catch return response_mod.internalError("set failed");
+                next.run();
+                _ = c.header("x-context-route", "1");
+                return c.takeResponse();
+            }
+        }.run,
+        struct {
+            fn run(c: *Context) Response {
+                return c.text(c.vars.get([]const u8, "message") orelse "missing");
+            }
+        }.run,
+    });
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/tuple-ctx"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("from tuple", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-context-route").?);
+}
+
+test "app route tuples work with onError and c.err" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.onError(struct {
+        fn run(err: anyerror, c: *Context) Response {
+            c.status(.bad_request);
+            return c.text(@errorName(err));
+        }
+    }.run);
+    try app.get("/tuple-error", .{
+        struct {
+            fn run(c: *Context, next: Context.Next) Response {
+                next.run();
+                if (c.err != null) {
+                    _ = c.header("x-route-error", "1");
+                }
+                return c.takeResponse();
+            }
+        }.run,
+        struct {
+            fn run(_: Request) !Response {
+                return error.TupleBoom;
+            }
+        }.run,
+    });
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/tuple-error"));
+    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
+    try std.testing.expectEqualStrings("TupleBoom", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-error").?);
 }
 
 test "app mount delegates prefixed requests to mounted apps" {

@@ -9,6 +9,7 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Exact-path plus dynamic-parameter routing through `zono.Router`
 - Hono-inspired route composition and middleware with `basePath()`, `route()`, `mount()`, `use()`, `useAt()`, `on()`, and `all()`
 - Minimal Hono-style `Context` handlers and middleware through `fn(c: *zono.Context) zono.Response`
+- App-level error handling through `app.onError()` and `!zono.Response` handlers
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zono.Server`
 - Request helpers for params, parsed params/query/cookie/header views, header lookup, cookies, and typed JSON parsing
@@ -121,6 +122,30 @@ pub fn main() !void {
 }
 ```
 
+### Route-Level Middleware
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+fn auth(req: zono.Request, next: zono.App.Next) zono.Response {
+    var res = next.run(req);
+    _ = res.header("x-auth", "1");
+    return res;
+}
+
+fn showPost(_: zono.Request) zono.Response {
+    return zono.text(.ok, "post");
+}
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/posts/:id", .{ auth, showPost });
+}
+```
+
 ### Context
 
 ```zig
@@ -147,6 +172,12 @@ pub fn main() !void {
     var app = zono.App.init(std.heap.page_allocator);
     defer app.deinit();
 
+    app.onError(struct {
+        fn run(err: anyerror, c: *zono.Context) zono.Response {
+            c.status(.bad_request);
+            return c.text(@errorName(err));
+        }
+    }.run);
     try app.use(poweredBy);
     try app.get("/hello", hello);
 }

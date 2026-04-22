@@ -18,6 +18,8 @@ pub const SharedState = struct {
     },
     variables: std.StringHashMapUnmanaged(VariableEntry) = .empty,
     not_found_handler: ?Handler = null,
+    on_error_handler: ?*const fn (err: anyerror, req: Request) Response = null,
+    last_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator) SharedState {
         return .{
@@ -94,6 +96,7 @@ pub const Context = struct {
     res: *Response,
     state: *SharedState,
     vars: Var,
+    err: ?anyerror = null,
 
     pub const Next = struct {
         ctx: *Context,
@@ -102,6 +105,7 @@ pub const Context = struct {
 
         pub fn run(self: Next) void {
             self.ctx.mergeResponse(self.run_fn(self.next_ctx, self.ctx.req));
+            self.ctx.err = self.ctx.state.last_error;
         }
     };
 
@@ -115,6 +119,7 @@ pub const Context = struct {
             .vars = .{
                 .state = state,
             },
+            .err = state.last_error,
         };
     }
 

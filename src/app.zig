@@ -293,7 +293,13 @@ pub const App = struct {
         var handled_req = req;
         var shared_state = context_mod.SharedState.init(handled_req.allocator);
         const owns_context_state = handled_req.context_state == null;
-        if (owns_context_state) handled_req.context_state = @ptrCast(&shared_state);
+        const state: *context_mod.SharedState = if (owns_context_state) blk: {
+            handled_req.context_state = @ptrCast(&shared_state);
+            break :blk &shared_state;
+        } else @ptrCast(@alignCast(handled_req.context_state.?));
+        const previous_not_found_handler = state.not_found_handler;
+        state.not_found_handler = self.not_found_handler;
+        defer state.not_found_handler = previous_not_found_handler;
         defer if (owns_context_state) shared_state.deinit();
 
         if (self.middlewares.items.len == 0) return self.handleEndpoint(handled_req);
@@ -1228,6 +1234,78 @@ test "app context middleware can set values for context handlers" {
     const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
     try std.testing.expectEqual(std.http.Status.accepted, res.status);
     try std.testing.expectEqualStrings("hello from context", res.body);
+}
+
+test "app context json serializes zig values" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/ctx-json", struct {
+        fn run(c: *Context) Response {
+            c.status(.accepted);
+            return c.json(.{
+                .ok = true,
+                .framework = "zono",
+            });
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-json"));
+    try std.testing.expectEqual(std.http.Status.accepted, res.status);
+    try std.testing.expectEqualStrings("application/json; charset=utf-8", res.content_type);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"framework\":\"zono\"}", res.body);
+}
+
+test "app context vars exposes request scoped values" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.set("message", "hello from var") catch return response_mod.internalError("set failed");
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/ctx-var", struct {
+        fn run(c: *Context) Response {
+            if (!c.vars.contains("message")) return response_mod.internalError("missing message");
+            const message = c.vars.get([]const u8, "message") orelse return response_mod.internalError("missing typed message");
+            return c.text(message);
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-var"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("hello from var", res.body);
+}
+
+test "app context notFound uses custom app notFound handler" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.notFound(struct {
+        fn run(req: Request) Response {
+            return response_mod.text(.not_found, req.path);
+        }
+    }.run);
+    try app.get("/ctx-miss", struct {
+        fn run(c: *Context) Response {
+            _ = c.header("x-before", "1");
+            return c.notFound();
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-miss"));
+    try std.testing.expectEqual(std.http.Status.not_found, res.status);
+    try std.testing.expectEqualStrings("/ctx-miss", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-before").?);
 }
 
 test "app mount delegates prefixed requests to mounted apps" {

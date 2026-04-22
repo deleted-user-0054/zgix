@@ -128,14 +128,19 @@ const std = @import("std");
 const zono = @import("zono");
 
 fn poweredBy(c: *zono.Context, next: zono.Context.Next) zono.Response {
+    c.set("framework", "zono") catch return zono.internalError("set failed");
     _ = c.header("x-powered-by", "zono");
     next.run();
     return c.takeResponse();
 }
 
 fn hello(c: *zono.Context) zono.Response {
+    const framework = c.vars.get([]const u8, "framework") orelse "unknown";
     c.status(.created);
-    return c.json("{\"message\":\"hello\"}");
+    return c.json(.{
+        .message = "hello",
+        .framework = framework,
+    });
 }
 
 pub fn main() !void {

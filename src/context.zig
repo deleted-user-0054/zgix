@@ -1,6 +1,7 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const Handler = @import("router.zig").Handler;
 
 const VariableEntry = struct {
     value: *anyopaque,
@@ -16,6 +17,7 @@ pub const SharedState = struct {
         .body = "",
     },
     variables: std.StringHashMapUnmanaged(VariableEntry) = .empty,
+    not_found_handler: ?Handler = null,
 
     pub fn init(allocator: std.mem.Allocator) SharedState {
         return .{
@@ -69,12 +71,29 @@ pub const SharedState = struct {
         const typed_value: *const T = @ptrCast(@alignCast(entry.value));
         return typed_value.*;
     }
+
+    pub fn contains(self: *const SharedState, key: []const u8) bool {
+        return self.variables.contains(key);
+    }
 };
 
 pub const Context = struct {
+    pub const Var = struct {
+        state: *const SharedState,
+
+        pub fn get(self: Var, comptime T: type, key: []const u8) ?T {
+            return self.state.get(T, key);
+        }
+
+        pub fn contains(self: Var, key: []const u8) bool {
+            return self.state.contains(key);
+        }
+    };
+
     req: Request,
     res: *Response,
     state: *SharedState,
+    vars: Var,
 
     pub const Next = struct {
         ctx: *Context,
@@ -93,6 +112,9 @@ pub const Context = struct {
             .req = req,
             .res = &state.response,
             .state = state,
+            .vars = .{
+                .state = state,
+            },
         };
     }
 
@@ -132,8 +154,26 @@ pub const Context = struct {
         return self.body(content, "text/html; charset=utf-8");
     }
 
-    pub fn json(self: *Context, content: []const u8) Response {
-        return self.body(content, "application/json; charset=utf-8");
+    pub fn json(self: *Context, value: anytype) Response {
+        const ValueType = @TypeOf(value);
+        if (comptime isStringLike(ValueType)) {
+            return self.body(value, "application/json; charset=utf-8");
+        }
+
+        var out: std.Io.Writer.Allocating = .init(self.req.allocator);
+        var stringify: std.json.Stringify = .{ .writer = &out.writer };
+        stringify.write(value) catch return @import("response.zig").internalError("json write failed");
+        return self.body(out.written(), "application/json; charset=utf-8");
+    }
+
+    pub fn notFound(self: *Context) Response {
+        const response = if (self.state.not_found_handler) |handler|
+            handler(self.req)
+        else
+            @import("response.zig").notFound();
+
+        self.mergeResponse(response);
+        return self.takeResponse();
     }
 
     pub fn redirect(self: *Context, location: []const u8, status_code: ?std.http.Status) Response {

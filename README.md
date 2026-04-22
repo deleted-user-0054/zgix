@@ -141,7 +141,7 @@ fn showPost(req: zgix.Request) zgix.Response {
 const zgix = @import("zgix");
 
 fn guarded(req: zgix.Request) zgix.Response {
-    var headers = req.headers() catch return zgix.internalError("invalid headers");
+    var headers = req.header(.all) catch return zgix.internalError("invalid headers");
     defer headers.deinit();
 
     if (headers.value("x-mode") == null) {

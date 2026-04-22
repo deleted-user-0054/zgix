@@ -380,14 +380,26 @@ pub const Request = struct {
         return try values.toOwnedSlice(self.allocator);
     }
 
-    pub fn header(self: Request, name: []const u8) ?[]const u8 {
-        for (self.header_list) |entry| {
-            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+    pub fn header(self: Request, name_or_mode: anytype) HeaderResultType(@TypeOf(name_or_mode)) {
+        const NameType = @TypeOf(name_or_mode);
+
+        if (comptime isStringLike(NameType)) {
+            comptime if (isEmptyStringLiteral(NameType)) {
+                @compileError("Use req.header(.all) to fetch all headers.");
+            };
+
+            const name: []const u8 = name_or_mode;
+            return self.headerValue(name);
         }
-        if (self.header_lookup_fn) |lookup| {
-            return lookup(self.header_lookup_ctx.?, name);
+
+        if (NameType == @TypeOf(.enum_literal)) {
+            if (name_or_mode != .all) {
+                @compileError("Request.header only supports .all for aggregate header access.");
+            }
+            return self.parseHeaders();
         }
-        return null;
+
+        @compileError("Request.header accepts a header name string or .all.");
     }
 
     pub fn headersSlice(self: Request) []const Header {
@@ -396,10 +408,6 @@ pub const Request = struct {
             return collect(self.header_lookup_ctx.?, self.allocator) catch &.{};
         }
         return self.header_list;
-    }
-
-    pub fn headers(self: Request) std.mem.Allocator.Error!ParsedHeaders {
-        return self.parseHeaders();
     }
 
     pub fn headerValues(self: Request, name: []const u8) std.mem.Allocator.Error![]const []const u8 {
@@ -595,7 +603,52 @@ pub const Request = struct {
         }
         return .{};
     }
+
+    fn headerValue(self: Request, name: []const u8) ?[]const u8 {
+        for (self.header_list) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+        }
+        if (self.header_lookup_fn) |lookup| {
+            return lookup(self.header_lookup_ctx.?, name);
+        }
+        return null;
+    }
 };
+
+fn HeaderResultType(comptime NameType: type) type {
+    if (comptime isStringLike(NameType)) return ?[]const u8;
+    if (NameType == @TypeOf(.enum_literal)) return std.mem.Allocator.Error!ParsedHeaders;
+    @compileError("Request.header accepts a header name string or .all.");
+}
+
+fn isStringLike(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => pointer.child == u8,
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| array.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        .array => |array| array.child == u8,
+        else => false,
+    };
+}
+
+fn isEmptyStringLiteral(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| array.child == u8 and array.len == 0,
+                else => false,
+            },
+            else => false,
+        },
+        .array => |array| array.child == u8 and array.len == 0,
+        else => false,
+    };
+}
 
 fn decodeFormComponent(allocator: std.mem.Allocator, input: []const u8) FormError![]const u8 {
     if (input.len == 0) return try allocator.alloc(u8, 0);
@@ -1098,7 +1151,7 @@ test "request headerValues collects repeated case-insensitive matches" {
     try std.testing.expectEqualStrings("router", values[1]);
 }
 
-test "request headers returns a case-insensitive aggregated header view" {
+test "request header .all returns a case-insensitive aggregated header view" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1110,7 +1163,7 @@ test "request headers returns a case-insensitive aggregated header view" {
         .{ .name = "X-Mode", .value = "test" },
     };
 
-    var parsed = try req.headers();
+    var parsed = try req.header(.all);
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("application/json; charset=utf-8", parsed.value("content-type").?);

@@ -72,8 +72,6 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
         else
             "";
 
-        const headers = collectHeaders(alloc, &raw_req) catch &.{};
-
         const body: []const u8 = blk: {
             const content_length = raw_req.head.content_length orelse break :blk "";
             if (content_length == 0) break :blk "";
@@ -88,17 +86,19 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 
         var req = Request.init(alloc, raw_req.head.method, path);
         req.query_string = query_string;
-        req.headers = headers;
-        req.cookies_raw = req.header("cookie") orelse "";
+        req.header_lookup_ctx = @ptrCast(&raw_req);
+        req.header_lookup_fn = lookupHeader;
+        req.headers_collect_fn = collectHeaders;
         req.body = body;
 
-        const response = app.handle(req);
-        sendResponse(&raw_req, response) catch break;
+        var response = app.handle(req);
+        defer response.deinit();
+        sendResponse(&raw_req, &response) catch break;
     }
 }
 
-fn sendResponse(raw_req: *std.http.Server.Request, response: Response) !void {
-    var extra_headers: [3 + Response.inline_header_capacity]std.http.Header = undefined;
+fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response) !void {
+    var extra_headers: [3]std.http.Header = undefined;
     var header_count: usize = 0;
 
     if (response.content_type.len > 0) {
@@ -113,28 +113,39 @@ fn sendResponse(raw_req: *std.http.Server.Request, response: Response) !void {
         extra_headers[header_count] = .{ .name = "allow", .value = allow };
         header_count += 1;
     }
-    for (response.extraHeaders()) |header| {
-        extra_headers[header_count] = header;
-        header_count += 1;
-    }
 
-    if (header_count == 0) {
+    if (header_count == 0 and response.extraHeaders().len == 0) {
         try raw_req.respond(response.body, .{
             .status = response.status,
         });
         return;
     }
 
+    if (response.extraHeaders().len == 0) {
+        try raw_req.respond(response.body, .{
+            .status = response.status,
+            .extra_headers = extra_headers[0..header_count],
+        });
+        return;
+    }
+
+    const response_headers = response.extraHeaders();
+    const combined_headers = try std.heap.smp_allocator.alloc(std.http.Header, header_count + response_headers.len);
+    defer std.heap.smp_allocator.free(combined_headers);
+    @memcpy(combined_headers[0..header_count], extra_headers[0..header_count]);
+    @memcpy(combined_headers[header_count .. header_count + response_headers.len], response_headers);
+
     try raw_req.respond(response.body, .{
         .status = response.status,
-        .extra_headers = extra_headers[0..header_count],
+        .extra_headers = combined_headers,
     });
 }
 
 fn collectHeaders(
+    ctx: *const anyopaque,
     allocator: std.mem.Allocator,
-    raw_req: *std.http.Server.Request,
 ) ![]const std.http.Header {
+    const raw_req: *std.http.Server.Request = @constCast(@ptrCast(@alignCast(ctx)));
     var headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     errdefer headers.deinit(allocator);
 
@@ -145,4 +156,13 @@ fn collectHeaders(
 
     if (headers.items.len == 0) return &.{};
     return try headers.toOwnedSlice(allocator);
+}
+
+fn lookupHeader(ctx: *const anyopaque, name: []const u8) ?[]const u8 {
+    const raw_req: *std.http.Server.Request = @constCast(@ptrCast(@alignCast(ctx)));
+    var iter = raw_req.iterateHeaders();
+    while (iter.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
 }

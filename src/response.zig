@@ -2,15 +2,12 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 
 pub const Response = struct {
-    pub const inline_header_capacity = 8;
-
     status: std.http.Status,
     content_type: []const u8,
     body: []const u8,
     location: ?[]const u8 = null,
     allow: ?[]const u8 = null,
-    extra_headers: [inline_header_capacity]std.http.Header = undefined,
-    extra_header_count: usize = 0,
+    extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty,
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
@@ -29,7 +26,7 @@ pub const Response = struct {
             return self.appendHeader(name, value);
         }
 
-        for (self.extra_headers[0..self.extra_header_count]) |*entry| {
+        for (self.extra_headers.items) |*entry| {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) {
                 entry.* = .{ .name = name, .value = value };
                 return true;
@@ -40,17 +37,20 @@ pub const Response = struct {
     }
 
     pub fn appendHeader(self: *Response, name: []const u8, value: []const u8) bool {
-        if (self.extra_header_count >= self.extra_headers.len) return false;
-        self.extra_headers[self.extra_header_count] = .{
+        self.extra_headers.append(std.heap.smp_allocator, .{
             .name = name,
             .value = value,
-        };
-        self.extra_header_count += 1;
+        }) catch return false;
         return true;
     }
 
     pub fn extraHeaders(self: *const Response) []const std.http.Header {
-        return self.extra_headers[0..self.extra_header_count];
+        return self.extra_headers.items;
+    }
+
+    pub fn deinit(self: *Response) void {
+        self.extra_headers.deinit(std.heap.smp_allocator);
+        self.extra_headers = .empty;
     }
 };
 
@@ -142,6 +142,7 @@ test "redirect chooses 301 for GET and 308 otherwise" {
 
 test "response inline headers support overwrite and append" {
     var res = text(.ok, "ok");
+    defer res.deinit();
 
     try std.testing.expect(res.header("cache-control", "max-age=60"));
     try std.testing.expect(res.header("Cache-Control", "no-store"));

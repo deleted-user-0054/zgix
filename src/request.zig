@@ -6,6 +6,8 @@ pub const Param = struct {
 };
 
 pub const Header = std.http.Header;
+const HeaderLookupFn = *const fn (ctx: *const anyopaque, name: []const u8) ?[]const u8;
+const HeadersCollectFn = *const fn (ctx: *const anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const Header;
 pub const FormError = std.mem.Allocator.Error || error{
     InvalidPercentEncoding,
 };
@@ -18,6 +20,9 @@ pub const Request = struct {
     body: []const u8 = "",
     cookies_raw: []const u8 = "",
     headers: []const Header = &.{},
+    header_lookup_ctx: ?*const anyopaque = null,
+    header_lookup_fn: ?HeaderLookupFn = null,
+    headers_collect_fn: ?HeadersCollectFn = null,
     params: []const Param = &.{},
 
     pub fn init(allocator: std.mem.Allocator, method: std.http.Method, path: []const u8) Request {
@@ -84,10 +89,17 @@ pub const Request = struct {
         for (self.headers) |entry| {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
         }
+        if (self.header_lookup_fn) |lookup| {
+            return lookup(self.header_lookup_ctx.?, name);
+        }
         return null;
     }
 
     pub fn headersSlice(self: Request) []const Header {
+        if (self.headers.len > 0) return self.headers;
+        if (self.headers_collect_fn) |collect| {
+            return collect(self.header_lookup_ctx.?, self.allocator) catch &.{};
+        }
         return self.headers;
     }
 
@@ -103,7 +115,10 @@ pub const Request = struct {
     }
 
     pub fn cookie(self: Request, name: []const u8) ?[]const u8 {
-        var rest = self.cookies_raw;
+        var rest = if (self.cookies_raw.len > 0)
+            self.cookies_raw
+        else
+            self.header("cookie") orelse "";
         while (rest.len > 0) {
             while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
             const semi = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
@@ -224,6 +239,16 @@ test "request header lookup is case-insensitive" {
     try std.testing.expectEqualStrings("application/json", req.header("Content-Type").?);
     try std.testing.expectEqualStrings("req-123", req.header("X-Request-Id").?);
     try std.testing.expect(req.header("missing") == null);
+}
+
+test "request cookie falls back to cookie header" {
+    var req = Request.init(std.testing.allocator, .GET, "/");
+    req.headers = &.{
+        .{ .name = "cookie", .value = "session=abc; theme=dark" },
+    };
+
+    try std.testing.expectEqualStrings("abc", req.cookie("session").?);
+    try std.testing.expectEqualStrings("dark", req.cookie("theme").?);
 }
 
 test "request queries returns all matching values" {

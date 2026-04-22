@@ -57,9 +57,9 @@ Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 <!-- BENCH:START -->
 | Metric | **zgix** | **merjs** | **Next.js** |
 |--------|----------|-----------|-------------|
-| Requests/sec (wrk) | **115449.60** | **83001.94** | **1326.92** |
-| Avg latency | **504.96us 0.87ms** | **690.27us 458.75us** | **88.13ms 154.36ms** |
-| RAM usage (under load) | **49.6 MB** | **3.2 MB** | **9.6 MB** |
+| Requests/sec (wrk) | **100896.56** | **83950.65** | **1300.09** |
+| Avg latency | **592.77us 1.18ms** | **699.12us 801.30us** | **89.37ms 156.19ms** |
+| RAM usage (under load) | **55.4 MB** | **3.2 MB** | **9.6 MB** |
 <!-- BENCH:END -->
 
 ## Examples

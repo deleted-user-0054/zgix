@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-04-22T08:45:51Z",
+  "timestamp": "2026-04-22T09:18:36Z",
   "runner": "ubuntu-latest",
   "target": {
     "zgix_route": "/api/json",
@@ -8,17 +8,17 @@
     "example": "benchmark"
   },
   "zgix": {
-    "requests_per_sec": 110165.64,
-    "avg_latency_ms": "530.82us 1.03ms",
-    "ram_mb": 52.7,
-    "binary_size": "328K",
-    "binary_bytes": 334328,
-    "source_files": 57,
+    "requests_per_sec": 96271.32,
+    "avg_latency_ms": "668.88us 1.90ms",
+    "ram_mb": 53.7,
+    "binary_size": "272K",
+    "binary_bytes": 277112,
+    "source_files": 8,
     "zig_version": "0.16.0"
   },
   "merjs": {
-    "requests_per_sec": 86907.92,
-    "avg_latency_ms": "679.81us 787.30us",
+    "requests_per_sec": 85000.82,
+    "avg_latency_ms": "676.51us 478.56us",
     "ram_mb": 3.2,
     "binary_size": "1016K",
     "binary_bytes": 1037784,
@@ -27,9 +27,9 @@
     "baseline_ref": "v0.2.5"
   },
   "nextjs": {
-    "requests_per_sec": 1317.93,
-    "avg_latency_ms": "88.68ms 155.32ms",
-    "ram_mb": 72.3,
+    "requests_per_sec": 1370.93,
+    "avg_latency_ms": "88.63ms 162.83ms",
+    "ram_mb": 71.6,
     "node_modules_size": "469M",
     "node_modules_bytes": 424178666,
     "node_modules_files": 20614,

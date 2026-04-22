@@ -138,6 +138,16 @@ pub const Request = struct {
         return self.queryParam(name);
     }
 
+    pub fn parseQuery(self: Request, query_options: ParseBodyOptions) FormError!ParsedBody {
+        if (self.query_string.len == 0) {
+            return .{
+                .allocator = self.allocator,
+            };
+        }
+
+        return try parseUrlEncodedPairs(self.allocator, self.query_string, query_options);
+    }
+
     pub fn queries(self: Request, name: []const u8) ![]const []const u8 {
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer values.deinit(self.allocator);
@@ -204,6 +214,21 @@ pub const Request = struct {
             rest = if (semi < rest.len) rest[semi + 1 ..] else "";
         }
         return null;
+    }
+
+    pub fn cookies(self: Request) std.mem.Allocator.Error!ParsedBody {
+        const raw_cookies = if (self.cookies_raw.len > 0)
+            self.cookies_raw
+        else
+            self.header("cookie") orelse "";
+
+        if (raw_cookies.len == 0) {
+            return .{
+                .allocator = self.allocator,
+            };
+        }
+
+        return try parseCookiePairs(self.allocator, raw_cookies);
     }
 
     pub fn text(self: Request) []const u8 {
@@ -358,13 +383,21 @@ fn parseUrlEncodedBody(
     body: []const u8,
     body_options: ParseBodyOptions,
 ) ParseBodyError!ParsedBody {
+    return try parseUrlEncodedPairs(allocator, body, body_options);
+}
+
+fn parseUrlEncodedPairs(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    body_options: ParseBodyOptions,
+) FormError!ParsedBody {
     var entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
     errdefer {
         deinitParsedBodyEntries(allocator, entries.items);
         entries.deinit(allocator);
     }
 
-    var rest = body;
+    var rest = input;
     while (rest.len > 0) {
         const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
         const pair = rest[0..amp];
@@ -378,6 +411,37 @@ fn parseUrlEncodedBody(
 
         try appendParsedBodyEntry(allocator, &entries, key, value, body_options);
         rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+    }
+
+    return .{
+        .allocator = allocator,
+        .entries = try entries.toOwnedSlice(allocator),
+    };
+}
+
+fn parseCookiePairs(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) std.mem.Allocator.Error!ParsedBody {
+    var entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
+    errdefer {
+        deinitParsedBodyEntries(allocator, entries.items);
+        entries.deinit(allocator);
+    }
+
+    var rest = input;
+    while (rest.len > 0) {
+        while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+        const semi = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+        const pair = rest[0..semi];
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        const key = try allocator.dupe(u8, pair[0..eq]);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, if (eq < pair.len) pair[eq + 1 ..] else "");
+        errdefer allocator.free(value);
+
+        try appendParsedBodyEntry(allocator, &entries, key, value, .{});
+        rest = if (semi < rest.len) rest[semi + 1 ..] else "";
     }
 
     return .{
@@ -553,6 +617,21 @@ test "request cookie falls back to cookie header" {
     try std.testing.expectEqualStrings("dark", req.cookie("theme").?);
 }
 
+test "request cookies returns an aggregated cookie view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/");
+    req.cookies_raw = "session=abc; theme=dark; empty=; session=override";
+
+    var parsed = try req.cookies();
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("override", parsed.value("session").?);
+    try std.testing.expectEqualStrings("dark", parsed.value("theme").?);
+    try std.testing.expectEqualStrings("", parsed.value("empty").?);
+}
+
 test "request queries returns all matching values" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -566,6 +645,48 @@ test "request queries returns all matching values" {
     try std.testing.expectEqualStrings("web", values[1]);
     try std.testing.expectEqualStrings("", values[2]);
     try std.testing.expectEqualStrings("router", values[3]);
+}
+
+test "request parseQuery returns an aggregated query view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/search");
+    req.query_string = "q=hello+world&tag=zig&tag=router&list%5B%5D=a&list%5B%5D=b&flag";
+
+    var parsed = try req.parseQuery(.{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("hello world", parsed.value("q").?);
+    try std.testing.expectEqualStrings("router", parsed.value("tag").?);
+    try std.testing.expectEqualStrings("", parsed.value("flag").?);
+    try std.testing.expect(!parsed.get("tag").?.isArray());
+
+    const list_values = parsed.values("list[]").?;
+    try std.testing.expectEqual(@as(usize, 2), list_values.len);
+    try std.testing.expectEqualStrings("a", list_values[0]);
+    try std.testing.expectEqualStrings("b", list_values[1]);
+    try std.testing.expect(parsed.get("list[]").?.isArray());
+}
+
+test "request parseQuery all collects repeated keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/search");
+    req.query_string = "tag=zig&tag=web&tag=router";
+
+    var parsed = try req.parseQuery(.{
+        .all = true,
+    });
+    defer parsed.deinit();
+
+    const values = parsed.values("tag").?;
+    try std.testing.expectEqual(@as(usize, 3), values.len);
+    try std.testing.expectEqualStrings("zig", values[0]);
+    try std.testing.expectEqualStrings("web", values[1]);
+    try std.testing.expectEqualStrings("router", values[2]);
+    try std.testing.expect(parsed.get("tag").?.isArray());
 }
 
 test "request json parses typed payloads" {

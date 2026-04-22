@@ -85,6 +85,45 @@ pub const Response = struct {
         return self.appendHeader(name, value);
     }
 
+    pub fn setStatus(self: *Response, status: std.http.Status) void {
+        self.status = status;
+    }
+
+    pub fn deleteHeader(self: *Response, name: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            self.clearSlice(&self.content_type);
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "location")) {
+            self.clearOptionalSlice(&self.location);
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "allow")) {
+            self.clearOptionalSlice(&self.allow);
+            return true;
+        }
+
+        var removed = false;
+        var index: usize = 0;
+        while (index < self.extra_headers.items.len) {
+            const entry = self.extra_headers.items[index];
+            if (!std.ascii.eqlIgnoreCase(entry.name, name)) {
+                index += 1;
+                continue;
+            }
+
+            if (self.owned_allocator) |allocator| {
+                allocator.free(entry.name);
+                allocator.free(entry.value);
+            }
+
+            _ = self.extra_headers.swapRemove(index);
+            removed = true;
+        }
+
+        return removed;
+    }
+
     pub fn appendHeader(self: *Response, name: []const u8, value: []const u8) bool {
         if (self.owned_allocator) |allocator| {
             const owned_name = allocator.dupe(u8, name) catch return false;
@@ -262,6 +301,20 @@ pub const Response = struct {
             return;
         }
         field.* = value;
+    }
+
+    fn clearSlice(self: *Response, field: *[]const u8) void {
+        if (self.owned_allocator) |allocator| {
+            allocator.free(field.*);
+        }
+        field.* = "";
+    }
+
+    fn clearOptionalSlice(self: *Response, field: *?[]const u8) void {
+        if (self.owned_allocator) |allocator| {
+            if (field.*) |existing| allocator.free(existing);
+        }
+        field.* = null;
     }
 
     fn replaceHeader(
@@ -595,6 +648,24 @@ test "response inline headers support overwrite and append" {
     try std.testing.expectEqualStrings("b=2", headers[2].value);
 }
 
+test "response deleteHeader removes special and extra headers" {
+    var res = text(.ok, "ok");
+    defer res.deinit();
+
+    try std.testing.expect(res.header("cache-control", "no-store"));
+    try std.testing.expect(res.header("content-type", "application/problem+json"));
+    try std.testing.expect(res.appendHeader("set-cookie", "a=1"));
+    try std.testing.expect(res.appendHeader("set-cookie", "b=2"));
+
+    try std.testing.expect(res.deleteHeader("cache-control"));
+    try std.testing.expect(res.deleteHeader("content-type"));
+    try std.testing.expect(res.deleteHeader("set-cookie"));
+    try std.testing.expect(!res.deleteHeader("missing"));
+
+    try std.testing.expectEqualStrings("", res.content_type);
+    try std.testing.expectEqual(@as(usize, 0), res.extraHeaders().len);
+}
+
 test "response body helper builds arbitrary content types" {
     const res = body(.created, "application/problem+json", "{\"ok\":false}");
 
@@ -701,4 +772,22 @@ test "response clone stays safe to mutate after cloning" {
         "session=abc123; Path=/; HttpOnly",
         cloned.extraHeaders()[1].value,
     );
+}
+
+test "response clone stays safe to delete headers after cloning" {
+    var res = text(.ok, "ok");
+    try std.testing.expect(res.header("cache-control", "no-store"));
+    try std.testing.expect(res.header("location", "/next"));
+
+    var cloned = try res.clone(std.testing.allocator);
+    defer cloned.deinit();
+    defer res.deinit();
+
+    cloned.setStatus(.created);
+    try std.testing.expect(cloned.deleteHeader("cache-control"));
+    try std.testing.expect(cloned.deleteHeader("location"));
+
+    try std.testing.expectEqual(std.http.Status.created, cloned.status);
+    try std.testing.expectEqual(@as(usize, 0), cloned.extraHeaders().len);
+    try std.testing.expect(cloned.location == null);
 }

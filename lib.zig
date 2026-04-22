@@ -6,6 +6,7 @@ pub const response = root.response;
 pub const router = root.router;
 pub const app = root.app;
 pub const server = root.server;
+pub const path = root.path;
 
 pub const Request = root.Request;
 pub const Param = root.Param;
@@ -20,9 +21,13 @@ pub const html = root.html;
 pub const json = root.json;
 pub const text = root.text;
 pub const notFound = root.notFound;
+pub const redirect = root.redirect;
+pub const options = root.options;
+pub const methodNotAllowed = root.methodNotAllowed;
 pub const internalError = root.internalError;
 pub const typedJson = root.typedJson;
 pub const parseJson = root.parseJson;
+pub const cleanPath = root.cleanPath;
 
 test {
     _ = root;

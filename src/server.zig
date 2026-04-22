@@ -103,18 +103,31 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 }
 
 fn sendResponse(raw_req: *std.http.Server.Request, response: Response) !void {
-    if (response.content_type.len == 0) {
+    var extra_headers: [3]std.http.Header = undefined;
+    var header_count: usize = 0;
+
+    if (response.content_type.len > 0) {
+        extra_headers[header_count] = .{ .name = "content-type", .value = response.content_type };
+        header_count += 1;
+    }
+    if (response.location) |location| {
+        extra_headers[header_count] = .{ .name = "location", .value = location };
+        header_count += 1;
+    }
+    if (response.allow) |allow| {
+        extra_headers[header_count] = .{ .name = "allow", .value = allow };
+        header_count += 1;
+    }
+
+    if (header_count == 0) {
         try raw_req.respond(response.body, .{
             .status = response.status,
         });
         return;
     }
 
-    const extra_headers = [_]std.http.Header{
-        .{ .name = "content-type", .value = response.content_type },
-    };
     try raw_req.respond(response.body, .{
         .status = response.status,
-        .extra_headers = &extra_headers,
+        .extra_headers = extra_headers[0..header_count],
     });
 }

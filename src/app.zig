@@ -20,6 +20,22 @@ pub const App = struct {
         target: MountTarget,
     };
 
+    const MiddlewareEntry = struct {
+        prefix: []const u8,
+        handler: Middleware,
+    };
+
+    pub const Next = struct {
+        ctx: *const anyopaque,
+        run_fn: *const fn (ctx: *const anyopaque, req: Request) Response,
+
+        pub fn run(self: Next, req: Request) Response {
+            return self.run_fn(self.ctx, req);
+        }
+    };
+
+    pub const Middleware = *const fn (req: Request, next: Next) Response;
+
     pub const RequestOptions = struct {
         method: std.http.Method = .GET,
         headers: []const std.http.Header = &.{},
@@ -37,6 +53,7 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     routes: std.ArrayListUnmanaged(Route) = .empty,
     mounts: std.ArrayListUnmanaged(Mount) = .empty,
+    middlewares: std.ArrayListUnmanaged(MiddlewareEntry) = .empty,
     router: ?Router = null,
     finalized: bool = false,
     strict: bool = true,
@@ -74,6 +91,10 @@ pub const App = struct {
             self.allocator.free(mount_entry.prefix);
         }
         self.mounts.deinit(self.allocator);
+        for (self.middlewares.items) |middleware_entry| {
+            self.allocator.free(middleware_entry.prefix);
+        }
+        self.middlewares.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -135,6 +156,14 @@ pub const App = struct {
         try self.registerOn(methods, paths, handler);
     }
 
+    pub fn use(self: *App, middleware: anytype) !void {
+        try self.addMiddleware("/", middleware);
+    }
+
+    pub fn useAt(self: *App, path: []const u8, middleware: anytype) !void {
+        try self.addMiddleware(path, middleware);
+    }
+
     pub fn basePath(self: *App, path: []const u8) !void {
         if (self.finalized) return error.AppFinalized;
 
@@ -176,6 +205,17 @@ pub const App = struct {
                 .handler = nested.handler,
             });
         }
+
+        for (other.middlewares.items) |nested| {
+            const nested_path = if (nested.prefix.len == 0) "/" else nested.prefix;
+            const full_prefix = try scopedMiddlewarePrefix(self.allocator, mounted_prefix, nested_path);
+            errdefer self.allocator.free(full_prefix);
+
+            try self.middlewares.append(self.allocator, .{
+                .prefix = full_prefix,
+                .handler = nested.handler,
+            });
+        }
     }
 
     pub fn mount(self: *App, prefix: []const u8, target: anytype) !void {
@@ -210,6 +250,18 @@ pub const App = struct {
         });
     }
 
+    pub fn addMiddleware(self: *App, path: []const u8, middleware: anytype) !void {
+        if (self.finalized) return error.AppFinalized;
+
+        const scoped_prefix = try scopedMiddlewarePrefix(self.allocator, self.base_path, path);
+        errdefer self.allocator.free(scoped_prefix);
+
+        try self.middlewares.append(self.allocator, .{
+            .prefix = scoped_prefix,
+            .handler = resolveMiddlewareHandler(middleware),
+        });
+    }
+
     pub fn finalize(self: *App) !void {
         if (self.finalized) return;
         self.router = try Router.init(self.allocator, self.routes.items);
@@ -218,6 +270,30 @@ pub const App = struct {
 
     pub fn handle(self: *App, req: Request) Response {
         if (!self.finalized) self.finalize() catch return response_mod.internalError("router init failed");
+        if (self.middlewares.items.len == 0) return self.handleEndpoint(req);
+        return self.runMiddlewares(req, 0);
+    }
+
+    fn runMiddlewares(self: *App, req: Request, start_index: usize) Response {
+        var middleware_index = start_index;
+        while (middleware_index < self.middlewares.items.len) : (middleware_index += 1) {
+            const middleware_entry = self.middlewares.items[middleware_index];
+            if (!middlewareMatches(middleware_entry.prefix, req.path, self.strict)) continue;
+
+            const frame = MiddlewareFrame{
+                .app = self,
+                .next_index = middleware_index + 1,
+            };
+            return middleware_entry.handler(req, .{
+                .ctx = &frame,
+                .run_fn = runMiddlewareNext,
+            });
+        }
+
+        return self.handleEndpoint(req);
+    }
+
+    fn handleEndpoint(self: *App, req: Request) Response {
         const router = &self.router.?;
         var lookup_req = req;
         lookup_req.path = canonicalPath(req.path, self.strict);
@@ -409,6 +485,16 @@ pub const App = struct {
     }
 };
 
+const MiddlewareFrame = struct {
+    app: *App,
+    next_index: usize,
+};
+
+fn runMiddlewareNext(ctx: *const anyopaque, req: Request) Response {
+    const frame: *const MiddlewareFrame = @ptrCast(@alignCast(ctx));
+    return frame.app.runMiddlewares(req, frame.next_index);
+}
+
 const MountMatch = struct {
     mount: *const App.Mount,
     path: []const u8,
@@ -448,6 +534,40 @@ fn normalizePrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8
     }
 
     return cleaned;
+}
+
+fn normalizeMiddlewarePrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+    const normalized = try normalizePrefix(allocator, prefix);
+    errdefer allocator.free(normalized);
+
+    if (normalized.len == 0 or std.mem.eql(u8, normalized, "/")) {
+        allocator.free(normalized);
+        return try allocator.dupe(u8, "");
+    }
+
+    return normalized;
+}
+
+fn scopedMiddlewarePrefix(allocator: std.mem.Allocator, base_path: []const u8, path: []const u8) ![]const u8 {
+    if (path.len == 0 or std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "*") or std.mem.eql(u8, path, "/*")) {
+        if (base_path.len == 0) return try allocator.dupe(u8, "");
+        return try allocator.dupe(u8, base_path);
+    }
+
+    const joined_path = try joinPrefixedPath(allocator, base_path, path);
+    defer allocator.free(joined_path);
+    return try normalizeMiddlewarePrefix(allocator, joined_path);
+}
+
+fn middlewareMatches(prefix: []const u8, path: []const u8, strict: bool) bool {
+    if (prefix.len == 0) return true;
+
+    const candidate_path = canonicalPath(path, strict);
+    if (std.mem.eql(u8, candidate_path, prefix)) return true;
+
+    return candidate_path.len > prefix.len and
+        std.mem.startsWith(u8, candidate_path, prefix) and
+        candidate_path[prefix.len] == '/';
 }
 
 fn joinPrefixedPath(allocator: std.mem.Allocator, prefix: []const u8, path: []const u8) ![]const u8 {
@@ -503,6 +623,20 @@ fn resolveMountTarget(target: anytype) App.MountTarget {
             else => @compileError("App.mount target must be a *zgix.App or a compatible handler."),
         },
         else => @compileError("App.mount target must be a *zgix.App or a compatible handler."),
+    };
+}
+
+fn resolveMiddlewareHandler(target: anytype) App.Middleware {
+    const TargetType = @TypeOf(target);
+    if (TargetType == App.Middleware) return target;
+
+    return switch (comptime @typeInfo(TargetType)) {
+        .@"fn" => target,
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"fn" => target,
+            else => @compileError("App.use middleware must be a compatible middleware handler."),
+        },
+        else => @compileError("App.use middleware must be a compatible middleware handler."),
     };
 }
 
@@ -598,6 +732,18 @@ fn isStringLike(comptime T: type) bool {
         .array => |array| array.child == u8,
         else => false,
     };
+}
+
+fn responseHeaderValue(res: Response, name: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "content-type")) return res.content_type;
+    if (std.ascii.eqlIgnoreCase(name, "location")) return res.location;
+    if (std.ascii.eqlIgnoreCase(name, "allow")) return res.allow;
+
+    for (res.extraHeaders()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+
+    return null;
 }
 
 test "app dispatches through finalized router" {
@@ -765,6 +911,92 @@ test "app routes expose aggregated params views" {
     const res = app.handle(Request.init(arena.allocator(), .GET, "/users/42/posts/hello-zig"));
     try std.testing.expectEqual(std.http.Status.ok, res.status);
     try std.testing.expectEqualStrings("hello-zig", res.body);
+}
+
+test "app use wraps downstream responses" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(req: Request, next: App.Next) Response {
+            var res = next.run(req);
+            _ = res.header("x-middleware", "yes");
+            return res;
+        }
+    }.run);
+    try app.get("/health", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "ok");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/health"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("yes", responseHeaderValue(res, "x-middleware").?);
+}
+
+test "app useAt applies middleware to matching prefixes only" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.useAt("/admin", struct {
+        fn run(req: Request, next: App.Next) Response {
+            if (!std.mem.eql(u8, req.header("x-admin") orelse "", "1")) {
+                return response_mod.text(.unauthorized, "denied");
+            }
+            return next.run(req);
+        }
+    }.run);
+    try app.get("/admin/panel", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "secret");
+        }
+    }.run);
+    try app.get("/health", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "ok");
+        }
+    }.run);
+
+    const denied = app.handle(Request.init(arena.allocator(), .GET, "/admin/panel"));
+    try std.testing.expectEqual(std.http.Status.unauthorized, denied.status);
+    try std.testing.expectEqualStrings("denied", denied.body);
+
+    const public = app.handle(Request.init(arena.allocator(), .GET, "/health"));
+    try std.testing.expectEqual(std.http.Status.ok, public.status);
+    try std.testing.expectEqualStrings("ok", public.body);
+}
+
+test "app route carries sub-app middleware" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var child = App.init(std.testing.allocator);
+    defer child.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try child.use(struct {
+        fn run(req: Request, next: App.Next) Response {
+            var res = next.run(req);
+            _ = res.header("x-child", req.path);
+            return res;
+        }
+    }.run);
+    try child.get("/hello", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "hello");
+        }
+    }.run);
+    try app.route("/api", &child);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/api/hello"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("hello", res.body);
+    try std.testing.expectEqualStrings("/api/hello", responseHeaderValue(res, "x-child").?);
 }
 
 test "app mount delegates prefixed requests to mounted apps" {

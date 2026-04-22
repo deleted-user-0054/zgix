@@ -7,7 +7,7 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Thin request/response handlers: `fn(req: zgix.Request) zgix.Response`
 - Explicit route registration through `zgix.App`
 - Exact-path plus dynamic-parameter routing through `zgix.Router`
-- Hono-inspired route composition with `basePath()`, `route()`, `mount()`, `on()`, and `all()`
+- Hono-inspired route composition and middleware with `basePath()`, `route()`, `mount()`, `use()`, `useAt()`, `on()`, and `all()`
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zgix.Server`
 - Request helpers for params, parsed params/query/cookie/header views, header lookup, cookies, and typed JSON parsing
@@ -94,6 +94,26 @@ pub fn main() !void {
     try users.get("/", listUsers);
     try app.route("/users", &users);
     app.notFound(notFound);
+}
+```
+
+### Middleware
+
+```zig
+const std = @import("std");
+const zgix = @import("zgix");
+
+fn logger(req: zgix.Request, next: zgix.App.Next) zgix.Response {
+    var res = next.run(req);
+    _ = res.header("x-middleware", req.path);
+    return res;
+}
+
+pub fn main() !void {
+    var app = zgix.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.use(logger);
 }
 ```
 

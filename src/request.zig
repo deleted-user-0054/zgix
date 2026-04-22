@@ -6,6 +6,9 @@ pub const Param = struct {
 };
 
 pub const Header = std.http.Header;
+pub const FormError = std.mem.Allocator.Error || error{
+    InvalidPercentEncoding,
+};
 
 pub const Request = struct {
     allocator: std.mem.Allocator,
@@ -88,6 +91,17 @@ pub const Request = struct {
         return self.headers;
     }
 
+    pub fn contentType(self: Request) ?[]const u8 {
+        const raw = self.header("content-type") orelse return null;
+        const semi = std.mem.indexOfScalar(u8, raw, ';') orelse raw.len;
+        return std.mem.trim(u8, raw[0..semi], " \t");
+    }
+
+    pub fn hasContentType(self: Request, value: []const u8) bool {
+        const content_type = self.contentType() orelse return false;
+        return std.ascii.eqlIgnoreCase(content_type, value);
+    }
+
     pub fn cookie(self: Request, name: []const u8) ?[]const u8 {
         var rest = self.cookies_raw;
         while (rest.len > 0) {
@@ -112,7 +126,76 @@ pub const Request = struct {
             .ignore_unknown_fields = true,
         });
     }
+
+    pub fn formValue(self: Request, name: []const u8) FormError!?[]const u8 {
+        if (!self.hasContentType("application/x-www-form-urlencoded") or self.body.len == 0) return null;
+
+        var rest = self.body;
+        while (rest.len > 0) {
+            const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+            const pair = rest[0..amp];
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+            const key_raw = pair[0..eq];
+            const value_raw = if (eq < pair.len) pair[eq + 1 ..] else "";
+            const decoded_key = try decodeFormComponent(self.allocator, key_raw);
+            if (std.mem.eql(u8, decoded_key, name)) {
+                return try decodeFormComponent(self.allocator, value_raw);
+            }
+            rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+        }
+
+        return null;
+    }
+
+    pub fn formValues(self: Request, name: []const u8) FormError![]const []const u8 {
+        if (!self.hasContentType("application/x-www-form-urlencoded") or self.body.len == 0) return &.{};
+
+        var values: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer values.deinit(self.allocator);
+
+        var rest = self.body;
+        while (rest.len > 0) {
+            const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+            const pair = rest[0..amp];
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+            const key_raw = pair[0..eq];
+            const value_raw = if (eq < pair.len) pair[eq + 1 ..] else "";
+            const decoded_key = try decodeFormComponent(self.allocator, key_raw);
+            if (std.mem.eql(u8, decoded_key, name)) {
+                try values.append(self.allocator, try decodeFormComponent(self.allocator, value_raw));
+            }
+            rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+        }
+
+        if (values.items.len == 0) return &.{};
+        return try values.toOwnedSlice(self.allocator);
+    }
 };
+
+fn decodeFormComponent(allocator: std.mem.Allocator, input: []const u8) FormError![]const u8 {
+    if (input.len == 0) return "";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        const c = input[index];
+        switch (c) {
+            '+' => try out.append(allocator, ' '),
+            '%' => {
+                if (index + 2 >= input.len) return error.InvalidPercentEncoding;
+                const hi = std.fmt.charToDigit(input[index + 1], 16) catch return error.InvalidPercentEncoding;
+                const lo = std.fmt.charToDigit(input[index + 2], 16) catch return error.InvalidPercentEncoding;
+                try out.append(allocator, @as(u8, @intCast((hi << 4) | lo)));
+                index += 2;
+            },
+            else => try out.append(allocator, c),
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
 
 test "request queryParam returns first matching value" {
     var req = Request.init(std.testing.allocator, .GET, "/search");
@@ -167,4 +250,48 @@ test "request json parses typed payloads" {
 
     const parsed = (try req.json(struct { title: []const u8 })).?;
     try std.testing.expectEqualStrings("hello", parsed.value.title);
+}
+
+test "request contentType ignores parameters" {
+    var req = Request.init(std.testing.allocator, .POST, "/submit");
+    req.headers = &.{
+        .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
+    };
+
+    try std.testing.expectEqualStrings("application/x-www-form-urlencoded", req.contentType().?);
+    try std.testing.expect(req.hasContentType("application/x-www-form-urlencoded"));
+    try std.testing.expect(!req.hasContentType("application/json"));
+}
+
+test "request formValue decodes urlencoded bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .POST, "/submit");
+    req.headers = &.{
+        .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
+    };
+    req.body = "title=hello+world&note=zig%2Bweb&empty";
+
+    try std.testing.expectEqualStrings("hello world", (try req.formValue("title")).?);
+    try std.testing.expectEqualStrings("zig+web", (try req.formValue("note")).?);
+    try std.testing.expectEqualStrings("", (try req.formValue("empty")).?);
+    try std.testing.expect((try req.formValue("missing")) == null);
+}
+
+test "request formValues collects repeated fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .POST, "/submit");
+    req.headers = &.{
+        .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
+    };
+    req.body = "tag=zig&tag=web+toolkit&tag=router";
+
+    const values = try req.formValues("tag");
+    try std.testing.expectEqual(@as(usize, 3), values.len);
+    try std.testing.expectEqualStrings("zig", values[0]);
+    try std.testing.expectEqualStrings("web toolkit", values[1]);
+    try std.testing.expectEqualStrings("router", values[2]);
 }

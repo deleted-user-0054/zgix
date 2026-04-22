@@ -10,6 +10,7 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Hono-inspired route composition with `basePath()`, `route()`, `on()`, and `all()`
 - Minimal server runtime under `zgix.Server`
 - Request helpers for params, query strings, headers, cookies, and typed JSON parsing
+- `application/x-www-form-urlencoded` parsing and a low-level `zgix.body()` response helper
 - Inline response headers without a middleware/context allocation layer
 
 ## Quick Start

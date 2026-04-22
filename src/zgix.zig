@@ -17,6 +17,7 @@ pub const Server = server.Server;
 pub const Options = server.Options;
 
 pub const html = response.html;
+pub const body = response.body;
 pub const json = response.json;
 pub const text = response.text;
 pub const notFound = response.notFound;

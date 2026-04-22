@@ -54,28 +54,24 @@ pub const Response = struct {
     }
 };
 
-pub fn html(body: []const u8) Response {
-    return .{
-        .status = .ok,
-        .content_type = "text/html; charset=utf-8",
-        .body = body,
-    };
-}
-
-pub fn json(body: []const u8) Response {
-    return .{
-        .status = .ok,
-        .content_type = "application/json; charset=utf-8",
-        .body = body,
-    };
-}
-
-pub fn text(status: std.http.Status, body: []const u8) Response {
+pub fn body(status: std.http.Status, content_type: []const u8, content: []const u8) Response {
     return .{
         .status = status,
-        .content_type = "text/plain; charset=utf-8",
-        .body = body,
+        .content_type = content_type,
+        .body = content,
     };
+}
+
+pub fn html(content: []const u8) Response {
+    return @This().body(.ok, "text/html; charset=utf-8", content);
+}
+
+pub fn json(content: []const u8) Response {
+    return @This().body(.ok, "application/json; charset=utf-8", content);
+}
+
+pub fn text(status: std.http.Status, content: []const u8) Response {
+    return @This().body(status, "text/plain; charset=utf-8", content);
 }
 
 pub fn notFound() Response {
@@ -159,4 +155,12 @@ test "response inline headers support overwrite and append" {
     try std.testing.expectEqualStrings("no-store", headers[0].value);
     try std.testing.expectEqualStrings("a=1", headers[1].value);
     try std.testing.expectEqualStrings("b=2", headers[2].value);
+}
+
+test "response body helper builds arbitrary content types" {
+    const res = body(.created, "application/problem+json", "{\"ok\":false}");
+
+    try std.testing.expectEqual(std.http.Status.created, res.status);
+    try std.testing.expectEqualStrings("application/problem+json", res.content_type);
+    try std.testing.expectEqualStrings("{\"ok\":false}", res.body);
 }

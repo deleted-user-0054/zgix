@@ -19,6 +19,7 @@ pub const Server = root.Server;
 pub const Options = root.Options;
 
 pub const html = root.html;
+pub const body = root.body;
 pub const json = root.json;
 pub const text = root.text;
 pub const notFound = root.notFound;

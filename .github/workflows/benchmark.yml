@@ -14,6 +14,11 @@ env:
   MERJS_ZIG_VERSION: 0.16.0
   MERJS_BASELINE_REF: v0.2.5
   BUN_VERSION: latest
+  BENCH_THREADS: 2
+  BENCH_CONNECTIONS: 100
+  BENCH_DURATION_SECONDS: 10
+  BENCH_WARMUP_SECONDS: 3
+  BENCH_RUNS: 3
 
 jobs:
   benchmark_zgix:
@@ -90,15 +95,37 @@ jobs:
             fi
           done
 
-          ZGIX_RSS_BEFORE=$(ps -o rss= -p "$ZGIX_PID" | tr -d ' ')
-          WRK_OUT=$(wrk -t2 -c100 -d10s http://127.0.0.1:3003/api/json)
-          echo "$WRK_OUT"
-          ZGIX_RSS_AFTER=$(ps -o rss= -p "$ZGIX_PID" | tr -d ' ')
-          ZGIX_RSS_KB=$(( ZGIX_RSS_BEFORE > ZGIX_RSS_AFTER ? ZGIX_RSS_BEFORE : ZGIX_RSS_AFTER ))
-          ZGIX_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $ZGIX_RSS_KB / 1024}")
+          if [ $((BENCH_RUNS % 2)) -eq 0 ]; then
+            echo "BENCH_RUNS must be an odd number to compute a median" >&2
+            exit 1
+          fi
 
-          ZGIX_RPS=$(echo "$WRK_OUT" | grep 'Requests/sec' | awk '{print $2}')
-          ZGIX_LAT=$(echo "$WRK_OUT" | grep 'Latency' | awk '{print $2 " " $3}')
+          echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s http://127.0.0.1:3003/api/json"
+          wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" http://127.0.0.1:3003/api/json >/dev/null
+
+          RESULT_FILE=$(mktemp)
+          trap 'rm -f "$RESULT_FILE"; kill $ZGIX_PID 2>/dev/null || true' EXIT
+          ZGIX_RSS_KB=$(ps -o rss= -p "$ZGIX_PID" | tr -d ' ')
+
+          for run in $(seq 1 "$BENCH_RUNS"); do
+            echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3003/api/json"
+            WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" http://127.0.0.1:3003/api/json)
+            echo "$WRK_OUT"
+
+            ZGIX_RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+            ZGIX_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
+            printf '%s\t%s\t%s\n' "$run" "$ZGIX_RPS" "$ZGIX_LAT" >> "$RESULT_FILE"
+
+            ZGIX_RSS_AFTER=$(ps -o rss= -p "$ZGIX_PID" | tr -d ' ')
+            if [ "$ZGIX_RSS_AFTER" -gt "$ZGIX_RSS_KB" ]; then
+              ZGIX_RSS_KB=$ZGIX_RSS_AFTER
+            fi
+          done
+
+          MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
+          ZGIX_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
+          ZGIX_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
+          ZGIX_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $ZGIX_RSS_KB / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"
@@ -217,15 +244,37 @@ jobs:
             fi
           done
 
-          MERJS_RSS_BEFORE=$(ps -o rss= -p "$MERJS_PID" | tr -d ' ')
-          WRK_OUT=$(wrk -t2 -c100 -d10s http://127.0.0.1:3002/api/json)
-          echo "$WRK_OUT"
-          MERJS_RSS_AFTER=$(ps -o rss= -p "$MERJS_PID" | tr -d ' ')
-          MERJS_RSS_KB=$(( MERJS_RSS_BEFORE > MERJS_RSS_AFTER ? MERJS_RSS_BEFORE : MERJS_RSS_AFTER ))
-          MERJS_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $MERJS_RSS_KB / 1024}")
+          if [ $((BENCH_RUNS % 2)) -eq 0 ]; then
+            echo "BENCH_RUNS must be an odd number to compute a median" >&2
+            exit 1
+          fi
 
-          MERJS_RPS=$(echo "$WRK_OUT" | grep 'Requests/sec' | awk '{print $2}')
-          MERJS_LAT=$(echo "$WRK_OUT" | grep 'Latency' | awk '{print $2 " " $3}')
+          echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s http://127.0.0.1:3002/api/json"
+          wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" http://127.0.0.1:3002/api/json >/dev/null
+
+          RESULT_FILE=$(mktemp)
+          trap 'rm -f "$RESULT_FILE"; kill $MERJS_PID 2>/dev/null || true' EXIT
+          MERJS_RSS_KB=$(ps -o rss= -p "$MERJS_PID" | tr -d ' ')
+
+          for run in $(seq 1 "$BENCH_RUNS"); do
+            echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3002/api/json"
+            WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" http://127.0.0.1:3002/api/json)
+            echo "$WRK_OUT"
+
+            MERJS_RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+            MERJS_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
+            printf '%s\t%s\t%s\n' "$run" "$MERJS_RPS" "$MERJS_LAT" >> "$RESULT_FILE"
+
+            MERJS_RSS_AFTER=$(ps -o rss= -p "$MERJS_PID" | tr -d ' ')
+            if [ "$MERJS_RSS_AFTER" -gt "$MERJS_RSS_KB" ]; then
+              MERJS_RSS_KB=$MERJS_RSS_AFTER
+            fi
+          done
+
+          MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
+          MERJS_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
+          MERJS_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
+          MERJS_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $MERJS_RSS_KB / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"
@@ -307,15 +356,37 @@ jobs:
             fi
           done
 
-          NEXT_RSS_BEFORE=$(ps -o rss= -p "$NEXT_PID" | tr -d ' ')
-          WRK_OUT=$(wrk -t2 -c100 -d10s http://127.0.0.1:3001/api/json)
-          echo "$WRK_OUT"
-          NEXT_RSS_AFTER=$(ps -o rss= -p "$NEXT_PID" | tr -d ' ')
-          NEXT_RSS_KB=$(( NEXT_RSS_BEFORE > NEXT_RSS_AFTER ? NEXT_RSS_BEFORE : NEXT_RSS_AFTER ))
-          NEXT_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $NEXT_RSS_KB / 1024}")
+          if [ $((BENCH_RUNS % 2)) -eq 0 ]; then
+            echo "BENCH_RUNS must be an odd number to compute a median" >&2
+            exit 1
+          fi
 
-          NEXT_RPS=$(echo "$WRK_OUT" | grep 'Requests/sec' | awk '{print $2}')
-          NEXT_LAT=$(echo "$WRK_OUT" | grep 'Latency' | awk '{print $2 " " $3}')
+          echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s http://127.0.0.1:3001/api/json"
+          wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" http://127.0.0.1:3001/api/json >/dev/null
+
+          RESULT_FILE=$(mktemp)
+          trap 'rm -f "$RESULT_FILE"; kill $NEXT_PID 2>/dev/null || true' EXIT
+          NEXT_RSS_KB=$(ps -o rss= -p "$NEXT_PID" | tr -d ' ')
+
+          for run in $(seq 1 "$BENCH_RUNS"); do
+            echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3001/api/json"
+            WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" http://127.0.0.1:3001/api/json)
+            echo "$WRK_OUT"
+
+            NEXT_RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+            NEXT_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
+            printf '%s\t%s\t%s\n' "$run" "$NEXT_RPS" "$NEXT_LAT" >> "$RESULT_FILE"
+
+            NEXT_RSS_AFTER=$(ps -o rss= -p "$NEXT_PID" | tr -d ' ')
+            if [ "$NEXT_RSS_AFTER" -gt "$NEXT_RSS_KB" ]; then
+              NEXT_RSS_KB=$NEXT_RSS_AFTER
+            fi
+          done
+
+          MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
+          NEXT_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
+          NEXT_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
+          NEXT_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $NEXT_RSS_KB / 1024}")
 
           {
             echo "build_ms=$BUILD_MS"
@@ -409,11 +480,11 @@ jobs:
           echo "| Build output | - | - | $NEXTJS_DOT_NEXT_SIZE (.next/) |" >> $GITHUB_STEP_SUMMARY
           echo "| Source files / node_modules files | $ZGIX_SOURCE_FILES files | $MERJS_SOURCE_FILES files | $NEXTJS_NODE_MODULES_FILES files |" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime deps | 0 | 0 | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Requests/sec** (wrk, 2t/100c/10s) | **${ZGIX_RPS}** | **${MERJS_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requests/sec** (wrk median, ${BENCH_THREADS}t/${BENCH_CONNECTIONS}c/${BENCH_DURATION_SECONDS}s) | **${ZGIX_RPS}** | **${MERJS_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
           echo "| **Avg latency** | **${ZGIX_LAT}** | **${MERJS_LAT}** | **${NEXTJS_LAT}** |" >> $GITHUB_STEP_SUMMARY
           echo "| **RAM usage** (under load) | **${ZGIX_RAM_MB} MB** | **${MERJS_RAM_MB} MB** | **${NEXTJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> Three isolated benchmark jobs run in parallel. merjs uses upstream release tag \`$MERJS_BASELINE_REF\`; Linux CI switches to its shipped threaded runtime fallback because the default io_uring path currently fails to compile under ubuntu-latest." >> $GITHUB_STEP_SUMMARY
+          echo "> Three isolated benchmark jobs run in parallel. Each target gets one ${BENCH_WARMUP_SECONDS}s warmup plus ${BENCH_RUNS} measured wrk runs, and the published Requests/sec is the median run with its matching latency. merjs uses upstream release tag \`$MERJS_BASELINE_REF\`; Linux CI switches to its shipped threaded runtime fallback because the default io_uring path currently fails to compile under ubuntu-latest." >> $GITHUB_STEP_SUMMARY
 
       - name: Fail if any benchmark job failed
         if: ${{ needs.benchmark_zgix.result != 'success' || needs.benchmark_merjs.result != 'success' || needs.benchmark_nextjs.result != 'success' }}
@@ -432,6 +503,15 @@ jobs:
           data = {
               "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "runner": "ubuntu-latest",
+              "benchmark": {
+                  "tool": "wrk",
+                  "threads": int(os.environ["BENCH_THREADS"]),
+                  "connections": int(os.environ["BENCH_CONNECTIONS"]),
+                  "duration_seconds": int(os.environ["BENCH_DURATION_SECONDS"]),
+                  "warmup_seconds": int(os.environ["BENCH_WARMUP_SECONDS"]),
+                  "runs": int(os.environ["BENCH_RUNS"]),
+                  "aggregation": "median_requests_per_sec_with_matching_latency",
+              },
               "target": {
                   "zgix_route": "/api/json",
                   "merjs_route": "/api/json",
@@ -484,7 +564,7 @@ jobs:
           block = "\n".join([
               "| Metric | **zgix** | **merjs** | **Next.js** |",
               "|--------|----------|-----------|-------------|",
-              f'| Requests/sec (wrk) | **{os.environ["ZGIX_RPS"]}** | **{os.environ["MERJS_RPS"]}** | **{os.environ["NEXTJS_RPS"]}** |',
+              f'| Requests/sec (wrk median) | **{os.environ["ZGIX_RPS"]}** | **{os.environ["MERJS_RPS"]}** | **{os.environ["NEXTJS_RPS"]}** |',
               f'| Avg latency | **{os.environ["ZGIX_LAT"]}** | **{os.environ["MERJS_LAT"]}** | **{os.environ["NEXTJS_LAT"]}** |',
               f'| RAM usage (under load) | **{os.environ["ZGIX_RAM_MB"]} MB** | **{os.environ["MERJS_RAM_MB"]} MB** | **{os.environ["NEXTJS_RAM_MB"]} MB** |',
           ])

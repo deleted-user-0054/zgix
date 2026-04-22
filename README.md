@@ -47,9 +47,11 @@ CI benchmarks compare:
 - A generated Next.js baseline on `GET /api/json`
 
 The three benchmarks run as isolated GitHub Actions jobs. All three baselines
-return the same tiny JSON payload and are load-tested with `wrk -t2 -c100 -d10s`.
-Build time is intentionally excluded from the table because the `merjs` row is
-treated as a release-tag runtime baseline rather than a source-build comparison.
+return the same tiny JSON payload and are warmed once before running three
+measured `wrk -t2 -c100 -d10s` samples. The table publishes the median
+Requests/sec run together with its matching latency. Build time is intentionally
+excluded from the table because the `merjs` row is treated as a release-tag
+runtime baseline rather than a source-build comparison.
 
 **CI benchmarks** (GitHub Actions, auto-updated on each push to `main`):
 

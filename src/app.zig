@@ -298,7 +298,7 @@ pub const App = struct {
 
         var req = Request.init(temp_allocator, req_options.method, split.path);
         req.query_string = split.query_string;
-        req.headers = req_options.headers;
+        req.header_list = req_options.headers;
         req.body = req_options.body;
         req.cookies_raw = req_options.cookies_raw orelse "";
 

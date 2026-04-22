@@ -87,6 +87,188 @@ pub const ParsedBody = struct {
     }
 };
 
+pub const ParsedHeaderEntry = struct {
+    name: []const u8,
+    values: [][]const u8,
+};
+
+pub const ParsedHeaderField = struct {
+    values: []const []const u8,
+
+    pub fn value(self: ParsedHeaderField) ?[]const u8 {
+        if (self.values.len == 0) return null;
+        return self.values[self.values.len - 1];
+    }
+
+    pub fn all(self: ParsedHeaderField) []const []const u8 {
+        return self.values;
+    }
+
+    pub fn isArray(self: ParsedHeaderField) bool {
+        return self.values.len > 1;
+    }
+};
+
+pub const ParsedHeaders = struct {
+    allocator: std.mem.Allocator,
+    entries: []const ParsedHeaderEntry = &.{},
+
+    pub fn get(self: ParsedHeaders, name: []const u8) ?ParsedHeaderField {
+        for (self.entries) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                return .{
+                    .values = entry.values,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn value(self: ParsedHeaders, name: []const u8) ?[]const u8 {
+        return if (self.get(name)) |field| field.value() else null;
+    }
+
+    pub fn values(self: ParsedHeaders, name: []const u8) ?[]const []const u8 {
+        return if (self.get(name)) |field| field.values else null;
+    }
+
+    pub fn entriesSlice(self: ParsedHeaders) []const ParsedHeaderEntry {
+        return self.entries;
+    }
+
+    pub fn deinit(self: *ParsedHeaders) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.name);
+            for (entry.values) |entry_value| {
+                self.allocator.free(entry_value);
+            }
+            self.allocator.free(entry.values);
+        }
+        if (self.entries.len > 0) self.allocator.free(self.entries);
+        self.entries = &.{};
+    }
+};
+
+pub const ParsedMultipartFile = struct {
+    filename: []const u8,
+    content_type: ?[]const u8 = null,
+    content: []const u8,
+};
+
+pub const ParsedMultipartFileEntry = struct {
+    key: []const u8,
+    files: []ParsedMultipartFile,
+    array_like: bool = false,
+};
+
+pub const ParsedMultipartFileField = struct {
+    files: []const ParsedMultipartFile,
+    array_like: bool = false,
+
+    pub fn value(self: ParsedMultipartFileField) ?ParsedMultipartFile {
+        if (self.files.len == 0) return null;
+        return self.files[self.files.len - 1];
+    }
+
+    pub fn all(self: ParsedMultipartFileField) []const ParsedMultipartFile {
+        return self.files;
+    }
+
+    pub fn isArray(self: ParsedMultipartFileField) bool {
+        return self.array_like or self.files.len > 1;
+    }
+};
+
+pub const ParsedMultipartFiles = struct {
+    allocator: std.mem.Allocator,
+    entries: []const ParsedMultipartFileEntry = &.{},
+
+    pub fn get(self: ParsedMultipartFiles, name: []const u8) ?ParsedMultipartFileField {
+        for (self.entries) |entry| {
+            if (std.mem.eql(u8, entry.key, name)) {
+                return .{
+                    .files = entry.files,
+                    .array_like = entry.array_like,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn file(self: ParsedMultipartFiles, name: []const u8) ?ParsedMultipartFile {
+        return if (self.get(name)) |field| field.value() else null;
+    }
+
+    pub fn files(self: ParsedMultipartFiles, name: []const u8) ?[]const ParsedMultipartFile {
+        return if (self.get(name)) |field| field.files else null;
+    }
+
+    pub fn entriesSlice(self: ParsedMultipartFiles) []const ParsedMultipartFileEntry {
+        return self.entries;
+    }
+
+    pub fn deinit(self: *ParsedMultipartFiles) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.key);
+            for (entry.files) |multipart_file| {
+                self.allocator.free(multipart_file.filename);
+                if (multipart_file.content_type) |content_type| self.allocator.free(content_type);
+                self.allocator.free(multipart_file.content);
+            }
+            self.allocator.free(entry.files);
+        }
+        if (self.entries.len > 0) self.allocator.free(self.entries);
+        self.entries = &.{};
+    }
+};
+
+pub const ParsedMultipart = struct {
+    fields: ParsedBody,
+    files: ParsedMultipartFiles,
+
+    pub fn init(allocator: std.mem.Allocator) ParsedMultipart {
+        return .{
+            .fields = .{ .allocator = allocator },
+            .files = .{ .allocator = allocator },
+        };
+    }
+
+    pub fn get(self: ParsedMultipart, name: []const u8) ?ParsedBodyField {
+        return self.fields.get(name);
+    }
+
+    pub fn value(self: ParsedMultipart, name: []const u8) ?[]const u8 {
+        return self.fields.value(name);
+    }
+
+    pub fn values(self: ParsedMultipart, name: []const u8) ?[]const []const u8 {
+        return self.fields.values(name);
+    }
+
+    pub fn getFile(self: ParsedMultipart, name: []const u8) ?ParsedMultipartFileField {
+        return self.files.get(name);
+    }
+
+    pub fn file(self: ParsedMultipart, name: []const u8) ?ParsedMultipartFile {
+        return self.files.file(name);
+    }
+
+    pub fn fileValues(self: ParsedMultipart, name: []const u8) ?[]const ParsedMultipartFile {
+        return self.files.files(name);
+    }
+
+    pub fn deinit(self: *ParsedMultipart) void {
+        self.fields.deinit();
+        self.files.deinit();
+    }
+};
+
+pub const ParsedFormData = ParsedMultipart;
+pub const ParsedFormFile = ParsedMultipartFile;
+pub const ParsedFormFiles = ParsedMultipartFiles;
+pub const ParsedFormFileEntry = ParsedMultipartFileEntry;
+pub const ParsedFormFileField = ParsedMultipartFileField;
+
 pub const Request = struct {
     allocator: std.mem.Allocator,
     method: std.http.Method,
@@ -94,7 +276,7 @@ pub const Request = struct {
     query_string: []const u8 = "",
     body: []const u8 = "",
     cookies_raw: []const u8 = "",
-    headers: []const Header = &.{},
+    header_list: []const Header = &.{},
     header_lookup_ctx: ?*const anyopaque = null,
     header_lookup_fn: ?HeaderLookupFn = null,
     headers_collect_fn: ?HeadersCollectFn = null,
@@ -199,7 +381,7 @@ pub const Request = struct {
     }
 
     pub fn header(self: Request, name: []const u8) ?[]const u8 {
-        for (self.headers) |entry| {
+        for (self.header_list) |entry| {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
         }
         if (self.header_lookup_fn) |lookup| {
@@ -209,11 +391,63 @@ pub const Request = struct {
     }
 
     pub fn headersSlice(self: Request) []const Header {
-        if (self.headers.len > 0) return self.headers;
+        if (self.header_list.len > 0) return self.header_list;
         if (self.headers_collect_fn) |collect| {
             return collect(self.header_lookup_ctx.?, self.allocator) catch &.{};
         }
-        return self.headers;
+        return self.header_list;
+    }
+
+    pub fn headers(self: Request) std.mem.Allocator.Error!ParsedHeaders {
+        return self.parseHeaders();
+    }
+
+    pub fn headerValues(self: Request, name: []const u8) std.mem.Allocator.Error![]const []const u8 {
+        const collected = try self.collectAllHeaders();
+        defer if (collected.owns_slice) self.allocator.free(collected.headers);
+
+        var values: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer values.deinit(self.allocator);
+
+        for (collected.headers) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                try values.append(self.allocator, entry.value);
+            }
+        }
+
+        if (values.items.len == 0) return &.{};
+        return try values.toOwnedSlice(self.allocator);
+    }
+
+    pub fn parseHeaders(self: Request) std.mem.Allocator.Error!ParsedHeaders {
+        const collected = try self.collectAllHeaders();
+        defer if (collected.owns_slice) self.allocator.free(collected.headers);
+
+        if (collected.headers.len == 0) {
+            return .{
+                .allocator = self.allocator,
+            };
+        }
+
+        var entries: std.ArrayListUnmanaged(ParsedHeaderEntry) = .empty;
+        errdefer {
+            deinitParsedHeaderEntries(self.allocator, entries.items);
+            entries.deinit(self.allocator);
+        }
+
+        for (collected.headers) |header_entry| {
+            const normalized_name = try normalizeHeaderName(self.allocator, header_entry.name);
+            errdefer self.allocator.free(normalized_name);
+            const value = try self.allocator.dupe(u8, header_entry.value);
+            errdefer self.allocator.free(value);
+
+            try appendParsedHeaderEntry(self.allocator, &entries, normalized_name, value);
+        }
+
+        return .{
+            .allocator = self.allocator,
+            .entries = try entries.toOwnedSlice(self.allocator),
+        };
     }
 
     pub fn contentType(self: Request) ?[]const u8 {
@@ -270,21 +504,31 @@ pub const Request = struct {
         });
     }
 
-    pub fn parseBody(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedBody {
+    pub fn parseBody(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedFormData {
         if (self.body.len == 0) {
-            return .{
-                .allocator = self.allocator,
-            };
+            return ParsedFormData.init(self.allocator);
         }
         if (self.hasContentType("application/x-www-form-urlencoded")) {
-            return try parseUrlEncodedBody(self.allocator, self.body, body_options);
+            return try parseUrlEncodedFormData(self.allocator, self.body, body_options);
         }
         if (self.hasContentType("multipart/form-data")) {
             const raw_content_type = self.header("content-type") orelse return error.MissingMultipartBoundary;
-            return try parseMultipartBody(self.allocator, raw_content_type, self.body, body_options);
+            return try parseMultipartForm(self.allocator, raw_content_type, self.body, body_options);
         } else {
             return error.UnsupportedContentType;
         }
+    }
+
+    pub fn parseMultipart(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedFormData {
+        if (self.body.len == 0) {
+            return ParsedFormData.init(self.allocator);
+        }
+        if (!self.hasContentType("multipart/form-data")) {
+            return error.UnsupportedContentType;
+        }
+
+        const raw_content_type = self.header("content-type") orelse return error.MissingMultipartBoundary;
+        return try parseMultipartForm(self.allocator, raw_content_type, self.body, body_options);
     }
 
     pub fn formValue(self: Request, name: []const u8) FormError!?[]const u8 {
@@ -329,6 +573,27 @@ pub const Request = struct {
 
         if (values.items.len == 0) return &.{};
         return try values.toOwnedSlice(self.allocator);
+    }
+
+    const CollectedHeaders = struct {
+        headers: []const Header = &.{},
+        owns_slice: bool = false,
+    };
+
+    fn collectAllHeaders(self: Request) std.mem.Allocator.Error!CollectedHeaders {
+        if (self.header_list.len > 0) {
+            return .{
+                .headers = self.header_list,
+            };
+        }
+        if (self.headers_collect_fn) |collect| {
+            const collected = try collect(self.header_lookup_ctx.?, self.allocator);
+            return .{
+                .headers = collected,
+                .owns_slice = collected.len > 0,
+            };
+        }
+        return .{};
     }
 };
 
@@ -405,12 +670,80 @@ fn deinitParsedBodyEntries(allocator: std.mem.Allocator, entries: []const Parsed
     }
 }
 
+fn deinitParsedHeaderEntries(allocator: std.mem.Allocator, entries: []const ParsedHeaderEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.name);
+        for (entry.values) |entry_value| {
+            allocator.free(entry_value);
+        }
+        allocator.free(entry.values);
+    }
+}
+
+fn deinitParsedMultipartFileEntries(allocator: std.mem.Allocator, entries: []const ParsedMultipartFileEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.key);
+        for (entry.files) |multipart_file| {
+            allocator.free(multipart_file.filename);
+            if (multipart_file.content_type) |content_type| allocator.free(content_type);
+            allocator.free(multipart_file.content);
+        }
+        allocator.free(entry.files);
+    }
+}
+
+fn normalizeHeaderName(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 {
+    const out = try allocator.dupe(u8, name);
+    for (out) |*char| {
+        char.* = std.ascii.toLower(char.*);
+    }
+    return out;
+}
+
+fn appendParsedHeaderEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(ParsedHeaderEntry),
+    name: []const u8,
+    value: []const u8,
+) std.mem.Allocator.Error!void {
+    for (entries.items) |*entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+
+        allocator.free(name);
+
+        const new_values = try allocator.alloc([]const u8, entry.values.len + 1);
+        @memcpy(new_values[0..entry.values.len], entry.values);
+        new_values[entry.values.len] = value;
+        allocator.free(entry.values);
+        entry.values = new_values;
+        return;
+    }
+
+    const values = try allocator.alloc([]const u8, 1);
+    values[0] = value;
+    try entries.append(allocator, .{
+        .name = name,
+        .values = values,
+    });
+}
+
 fn parseUrlEncodedBody(
     allocator: std.mem.Allocator,
     body: []const u8,
     body_options: ParseBodyOptions,
 ) ParseBodyError!ParsedBody {
     return try parseUrlEncodedPairs(allocator, body, body_options);
+}
+
+fn parseUrlEncodedFormData(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    body_options: ParseBodyOptions,
+) ParseBodyError!ParsedFormData {
+    return .{
+        .fields = try parseUrlEncodedPairs(allocator, body, body_options),
+        .files = .{ .allocator = allocator },
+    };
 }
 
 fn parseUrlEncodedPairs(
@@ -477,22 +810,25 @@ fn parseCookiePairs(
     };
 }
 
-fn parseMultipartBody(
+fn parseMultipartForm(
     allocator: std.mem.Allocator,
     raw_content_type: []const u8,
     body: []const u8,
     body_options: ParseBodyOptions,
-) ParseBodyError!ParsedBody {
+) ParseBodyError!ParsedFormData {
     const boundary = extractMultipartBoundary(raw_content_type) orelse return error.MissingMultipartBoundary;
     const delimiter = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
     defer allocator.free(delimiter);
     const separator = try std.fmt.allocPrint(allocator, "\r\n--{s}", .{boundary});
     defer allocator.free(separator);
 
-    var entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
+    var field_entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
+    var file_entries: std.ArrayListUnmanaged(ParsedMultipartFileEntry) = .empty;
     errdefer {
-        deinitParsedBodyEntries(allocator, entries.items);
-        entries.deinit(allocator);
+        deinitParsedBodyEntries(allocator, field_entries.items);
+        field_entries.deinit(allocator);
+        deinitParsedMultipartFileEntries(allocator, file_entries.items);
+        file_entries.deinit(allocator);
     }
 
     var rest = body;
@@ -515,18 +851,43 @@ fn parseMultipartBody(
         rest = rest[separator_index + separator.len ..];
 
         const parsed_part = try parseMultipartPart(part);
-        if (parsed_part.filename != null) return error.UnsupportedMultipartFile;
 
-        const key = try allocator.dupe(u8, parsed_part.name);
-        errdefer allocator.free(key);
-        const value = try allocator.dupe(u8, parsed_part.value);
-        errdefer allocator.free(value);
-        try appendParsedBodyEntry(allocator, &entries, key, value, body_options);
+        if (parsed_part.filename) |filename| {
+            const key = try allocator.dupe(u8, parsed_part.name);
+            errdefer allocator.free(key);
+            const owned_filename = try allocator.dupe(u8, filename);
+            errdefer allocator.free(owned_filename);
+            const owned_content = try allocator.dupe(u8, parsed_part.value);
+            errdefer allocator.free(owned_content);
+            const owned_content_type = if (parsed_part.content_type) |content_type|
+                try allocator.dupe(u8, content_type)
+            else
+                null;
+            errdefer if (owned_content_type) |content_type| allocator.free(content_type);
+
+            try appendParsedMultipartFileEntry(allocator, &file_entries, key, .{
+                .filename = owned_filename,
+                .content_type = owned_content_type,
+                .content = owned_content,
+            });
+        } else {
+            const key = try allocator.dupe(u8, parsed_part.name);
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, parsed_part.value);
+            errdefer allocator.free(value);
+            try appendParsedBodyEntry(allocator, &field_entries, key, value, body_options);
+        }
     }
 
     return .{
-        .allocator = allocator,
-        .entries = try entries.toOwnedSlice(allocator),
+        .fields = .{
+            .allocator = allocator,
+            .entries = try field_entries.toOwnedSlice(allocator),
+        },
+        .files = .{
+            .allocator = allocator,
+            .entries = try file_entries.toOwnedSlice(allocator),
+        },
     };
 }
 
@@ -534,6 +895,7 @@ const ParsedMultipartPart = struct {
     name: []const u8,
     value: []const u8,
     filename: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
 };
 
 fn parseMultipartPart(part: []const u8) ParseBodyError!ParsedMultipartPart {
@@ -542,6 +904,7 @@ fn parseMultipartPart(part: []const u8) ParseBodyError!ParsedMultipartPart {
     const value = part[separator_index + 4 ..];
 
     var disposition_value: ?[]const u8 = null;
+    var content_type_value: ?[]const u8 = null;
     var rest = headers_block;
     while (rest.len > 0) {
         const line_end = std.mem.indexOf(u8, rest, "\r\n") orelse rest.len;
@@ -551,6 +914,8 @@ fn parseMultipartPart(part: []const u8) ParseBodyError!ParsedMultipartPart {
         const header_value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(header_name, "content-disposition")) {
             disposition_value = header_value;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "content-type")) {
+            content_type_value = header_value;
         }
         rest = if (line_end < rest.len) rest[line_end + 2 ..] else "";
     }
@@ -562,7 +927,37 @@ fn parseMultipartPart(part: []const u8) ParseBodyError!ParsedMultipartPart {
         .name = extractDispositionParameter(disposition, "name") orelse return error.InvalidMultipartBody,
         .value = value,
         .filename = extractDispositionParameter(disposition, "filename"),
+        .content_type = content_type_value,
     };
+}
+
+fn appendParsedMultipartFileEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(ParsedMultipartFileEntry),
+    key: []const u8,
+    file: ParsedMultipartFile,
+) std.mem.Allocator.Error!void {
+    for (entries.items) |*entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+
+        allocator.free(key);
+
+        const new_files = try allocator.alloc(ParsedMultipartFile, entry.files.len + 1);
+        @memcpy(new_files[0..entry.files.len], entry.files);
+        new_files[entry.files.len] = file;
+        allocator.free(entry.files);
+        entry.files = new_files;
+        entry.array_like = true;
+        return;
+    }
+
+    const files = try allocator.alloc(ParsedMultipartFile, 1);
+    files[0] = file;
+    try entries.append(allocator, .{
+        .key = key,
+        .files = files,
+        .array_like = std.mem.endsWith(u8, key, "[]"),
+    });
 }
 
 fn extractMultipartBoundary(raw_content_type: []const u8) ?[]const u8 {
@@ -676,7 +1071,7 @@ test "request cookie parses raw cookie header" {
 
 test "request header lookup is case-insensitive" {
     var req = Request.init(std.testing.allocator, .GET, "/");
-    req.headers = &.{
+    req.header_list = &.{
         .{ .name = "content-type", .value = "application/json" },
         .{ .name = "x-request-id", .value = "req-123" },
     };
@@ -686,9 +1081,54 @@ test "request header lookup is case-insensitive" {
     try std.testing.expect(req.header("missing") == null);
 }
 
+test "request headerValues collects repeated case-insensitive matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/");
+    req.header_list = &.{
+        .{ .name = "x-tag", .value = "zig" },
+        .{ .name = "X-Tag", .value = "router" },
+        .{ .name = "x-request-id", .value = "req-123" },
+    };
+
+    const values = try req.headerValues("x-tag");
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expectEqualStrings("zig", values[0]);
+    try std.testing.expectEqualStrings("router", values[1]);
+}
+
+test "request headers returns a case-insensitive aggregated header view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/");
+    req.header_list = &.{
+        .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+        .{ .name = "Set-Cookie", .value = "a=1" },
+        .{ .name = "set-cookie", .value = "b=2" },
+        .{ .name = "X-Mode", .value = "test" },
+    };
+
+    var parsed = try req.headers();
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("application/json; charset=utf-8", parsed.value("content-type").?);
+    try std.testing.expectEqualStrings("application/json; charset=utf-8", parsed.value("Content-Type").?);
+    try std.testing.expectEqualStrings("test", parsed.value("x-mode").?);
+
+    const cookies = parsed.values("set-cookie").?;
+    try std.testing.expectEqual(@as(usize, 2), cookies.len);
+    try std.testing.expectEqualStrings("a=1", cookies[0]);
+    try std.testing.expectEqualStrings("b=2", cookies[1]);
+    try std.testing.expect(parsed.get("set-cookie").?.isArray());
+
+    try std.testing.expectEqualStrings("content-type", parsed.entriesSlice()[0].name);
+}
+
 test "request cookie falls back to cookie header" {
     var req = Request.init(std.testing.allocator, .GET, "/");
-    req.headers = &.{
+    req.header_list = &.{
         .{ .name = "cookie", .value = "session=abc; theme=dark" },
     };
 
@@ -781,7 +1221,7 @@ test "request json parses typed payloads" {
 
 test "request contentType ignores parameters" {
     var req = Request.init(std.testing.allocator, .POST, "/submit");
-    req.headers = &.{
+    req.header_list = &.{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
     };
 
@@ -795,7 +1235,7 @@ test "request formValue decodes urlencoded bodies" {
     defer arena.deinit();
 
     var req = Request.init(arena.allocator(), .POST, "/submit");
-    req.headers = &.{
+    req.header_list = &.{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
     };
     req.body = "title=hello+world&note=zig%2Bweb&empty";
@@ -811,7 +1251,7 @@ test "request formValues collects repeated fields" {
     defer arena.deinit();
 
     var req = Request.init(arena.allocator(), .POST, "/submit");
-    req.headers = &.{
+    req.header_list = &.{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
     };
     req.body = "tag=zig&tag=web+toolkit&tag=router";
@@ -825,7 +1265,7 @@ test "request formValues collects repeated fields" {
 
 test "request parseBody keeps the last scalar value and preserves array-like keys" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.headers = &.{
+    parsed_req.header_list = &.{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
     };
     parsed_req.body = "title=hello&title=updated&tag%5B%5D=zig&tag%5B%5D=router&empty";
@@ -847,7 +1287,7 @@ test "request parseBody keeps the last scalar value and preserves array-like key
 
 test "request parseBody all collects repeated scalar fields" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.headers = &.{
+    parsed_req.header_list = &.{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
     };
     parsed_req.body = "tag=zig&tag=web+toolkit&tag=router";
@@ -868,7 +1308,7 @@ test "request parseBody all collects repeated scalar fields" {
 
 test "request parseBody rejects unsupported content types" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.headers = &.{
+    parsed_req.header_list = &.{
         .{ .name = "content-type", .value = "application/json" },
     };
     parsed_req.body = "{\"title\":\"hello\"}";
@@ -878,7 +1318,7 @@ test "request parseBody rejects unsupported content types" {
 
 test "request parseBody parses multipart text fields" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.headers = &.{
+    parsed_req.header_list = &.{
         .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
     };
     parsed_req.body =
@@ -905,7 +1345,7 @@ test "request parseBody parses multipart text fields" {
 
 test "request parseBody multipart all collects repeated fields" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.headers = &.{
+    parsed_req.header_list = &.{
         .{ .name = "content-type", .value = "multipart/form-data; boundary=\"zgix-boundary\"" },
     };
     parsed_req.body =
@@ -928,17 +1368,80 @@ test "request parseBody multipart all collects repeated fields" {
     try std.testing.expectEqualStrings("web toolkit", tags[1]);
 }
 
-test "request parseBody multipart rejects file parts for now" {
+test "request parseMultipart returns text fields and files" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.headers = &.{
+    parsed_req.header_list = &.{
         .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
     };
     parsed_req.body =
+        "--zgix-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"title\"\r\n\r\n" ++
+        "hello world\r\n" ++
         "--zgix-boundary\r\n" ++
         "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.txt\"\r\n" ++
         "Content-Type: text/plain\r\n\r\n" ++
         "hello\r\n" ++
         "--zgix-boundary--\r\n";
 
-    try std.testing.expectError(error.UnsupportedMultipartFile, parsed_req.parseBody(.{}));
+    var multipart = try parsed_req.parseMultipart(.{});
+    defer multipart.deinit();
+
+    try std.testing.expectEqualStrings("hello world", multipart.value("title").?);
+
+    const avatar = multipart.file("avatar").?;
+    try std.testing.expectEqualStrings("a.txt", avatar.filename);
+    try std.testing.expectEqualStrings("text/plain", avatar.content_type.?);
+    try std.testing.expectEqualStrings("hello", avatar.content);
+}
+
+test "request parseMultipart collects repeated files" {
+    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
+    parsed_req.header_list = &.{
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
+    };
+    parsed_req.body =
+        "--zgix-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"photos[]\"; filename=\"a.txt\"\r\n\r\n" ++
+        "A\r\n" ++
+        "--zgix-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"photos[]\"; filename=\"b.txt\"\r\n\r\n" ++
+        "B\r\n" ++
+        "--zgix-boundary--\r\n";
+
+    var multipart = try parsed_req.parseMultipart(.{});
+    defer multipart.deinit();
+
+    const photos = multipart.fileValues("photos[]").?;
+    try std.testing.expectEqual(@as(usize, 2), photos.len);
+    try std.testing.expectEqualStrings("a.txt", photos[0].filename);
+    try std.testing.expectEqualStrings("A", photos[0].content);
+    try std.testing.expectEqualStrings("b.txt", photos[1].filename);
+    try std.testing.expectEqualStrings("B", photos[1].content);
+    try std.testing.expect(multipart.getFile("photos[]").?.isArray());
+}
+
+test "request parseBody multipart returns files directly" {
+    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
+    parsed_req.header_list = &.{
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zgix-boundary" },
+    };
+    parsed_req.body =
+        "--zgix-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"title\"\r\n\r\n" ++
+        "hello world\r\n" ++
+        "--zgix-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.txt\"\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++
+        "hello\r\n" ++
+        "--zgix-boundary--\r\n";
+
+    var body = try parsed_req.parseBody(.{});
+    defer body.deinit();
+
+    try std.testing.expectEqualStrings("hello world", body.value("title").?);
+
+    const avatar = body.file("avatar").?;
+    try std.testing.expectEqualStrings("a.txt", avatar.filename);
+    try std.testing.expectEqualStrings("text/plain", avatar.content_type.?);
+    try std.testing.expectEqualStrings("hello", avatar.content);
 }

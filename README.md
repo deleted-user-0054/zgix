@@ -10,8 +10,8 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Hono-inspired route composition with `basePath()`, `route()`, `mount()`, `on()`, and `all()`
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zgix.Server`
-- Request helpers for params, parsed params/query/cookie views, headers, cookies, and typed JSON parsing
-- `application/x-www-form-urlencoded` parsing, text-only `multipart/form-data` `Request.parseBody()`, `Response.cookie()`, and a low-level `zgix.body()` response helper
+- Request helpers for params, parsed params/query/cookie/header views, header lookup, cookies, and typed JSON parsing
+- `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing through `Request.parseBody()`, `Response.cookie()`, and a low-level `zgix.body()` response helper
 - `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start
@@ -132,6 +132,39 @@ fn showPost(req: zgix.Request) zgix.Response {
     const slug = params.value("slug") orelse "missing";
     const body = req.allocator.dupe(u8, slug) catch return zgix.internalError("alloc failed");
     return zgix.text(.ok, body);
+}
+```
+
+### Aggregating Headers
+
+```zig
+const zgix = @import("zgix");
+
+fn guarded(req: zgix.Request) zgix.Response {
+    var headers = req.headers() catch return zgix.internalError("invalid headers");
+    defer headers.deinit();
+
+    if (headers.value("x-mode") == null) {
+        return zgix.text(.bad_request, "missing x-mode");
+    }
+
+    return zgix.text(.ok, "ok");
+}
+```
+
+### Parsing Multipart Files
+
+```zig
+const zgix = @import("zgix");
+
+fn upload(req: zgix.Request) zgix.Response {
+    var body = req.parseBody(.{}) catch return zgix.text(.bad_request, "invalid multipart body");
+    defer body.deinit();
+
+    const avatar = body.file("avatar") orelse return zgix.text(.bad_request, "missing avatar");
+    _ = avatar;
+
+    return zgix.text(.ok, body.value("display_name") orelse "ok");
 }
 ```
 

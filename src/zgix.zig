@@ -15,6 +15,7 @@ pub const Router = router.Router;
 pub const Route = router.Route;
 pub const Server = server.Server;
 pub const Options = server.Options;
+pub const AppRequestOptions = app.App.RequestOptions;
 
 pub const html = response.html;
 pub const body = response.body;

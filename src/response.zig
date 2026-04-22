@@ -8,6 +8,8 @@ pub const Response = struct {
     location: ?[]const u8 = null,
     allow: ?[]const u8 = null,
     extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty,
+    extra_headers_allocator: ?std.mem.Allocator = null,
+    owned_allocator: ?std.mem.Allocator = null,
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
@@ -37,10 +39,12 @@ pub const Response = struct {
     }
 
     pub fn appendHeader(self: *Response, name: []const u8, value: []const u8) bool {
-        self.extra_headers.append(std.heap.smp_allocator, .{
+        const allocator = self.extra_headers_allocator orelse std.heap.smp_allocator;
+        self.extra_headers.append(allocator, .{
             .name = name,
             .value = value,
         }) catch return false;
+        self.extra_headers_allocator = allocator;
         return true;
     }
 
@@ -48,9 +52,46 @@ pub const Response = struct {
         return self.extra_headers.items;
     }
 
+    pub fn clone(self: Response, allocator: std.mem.Allocator) !Response {
+        var cloned: Response = .{
+            .status = self.status,
+            .content_type = try allocator.dupe(u8, self.content_type),
+            .body = try allocator.dupe(u8, self.body),
+            .location = if (self.location) |location| try allocator.dupe(u8, location) else null,
+            .allow = if (self.allow) |allow| try allocator.dupe(u8, allow) else null,
+            .extra_headers_allocator = allocator,
+            .owned_allocator = allocator,
+        };
+        errdefer cloned.deinit();
+
+        for (self.extra_headers.items) |extra_header| {
+            try cloned.extra_headers.append(allocator, .{
+                .name = try allocator.dupe(u8, extra_header.name),
+                .value = try allocator.dupe(u8, extra_header.value),
+            });
+        }
+
+        return cloned;
+    }
+
     pub fn deinit(self: *Response) void {
-        self.extra_headers.deinit(std.heap.smp_allocator);
+        if (self.owned_allocator) |allocator| {
+            allocator.free(self.content_type);
+            allocator.free(self.body);
+            if (self.location) |location| allocator.free(location);
+            if (self.allow) |allow| allocator.free(allow);
+            for (self.extra_headers.items) |extra_header| {
+                allocator.free(extra_header.name);
+                allocator.free(extra_header.value);
+            }
+        }
+
+        if (self.extra_headers_allocator) |allocator| {
+            self.extra_headers.deinit(allocator);
+        }
         self.extra_headers = .empty;
+        self.extra_headers_allocator = null;
+        self.owned_allocator = null;
     }
 };
 
@@ -164,4 +205,21 @@ test "response body helper builds arbitrary content types" {
     try std.testing.expectEqual(std.http.Status.created, res.status);
     try std.testing.expectEqualStrings("application/problem+json", res.content_type);
     try std.testing.expectEqualStrings("{\"ok\":false}", res.body);
+}
+
+test "response clone owns duplicated data" {
+    var res = text(.accepted, "ok");
+    try std.testing.expect(res.header("cache-control", "no-store"));
+    try std.testing.expect(res.appendHeader("set-cookie", "a=1"));
+
+    var cloned = try res.clone(std.testing.allocator);
+    defer cloned.deinit();
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.accepted, cloned.status);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", cloned.content_type);
+    try std.testing.expectEqualStrings("ok", cloned.body);
+    try std.testing.expectEqual(@as(usize, 2), cloned.extraHeaders().len);
+    try std.testing.expectEqualStrings("no-store", cloned.extraHeaders()[0].value);
+    try std.testing.expectEqualStrings("a=1", cloned.extraHeaders()[1].value);
 }

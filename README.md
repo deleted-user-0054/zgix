@@ -7,11 +7,11 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Thin request/response handlers: `fn(req: zgix.Request) zgix.Response`
 - Explicit route registration through `zgix.App`
 - Exact-path plus dynamic-parameter routing through `zgix.Router`
-- Hono-inspired route composition with `basePath()`, `route()`, `on()`, and `all()`
+- Hono-inspired route composition with `basePath()`, `route()`, `mount()`, `on()`, and `all()`
 - Minimal server runtime under `zgix.Server`
 - Request helpers for params, query strings, headers, cookies, and typed JSON parsing
 - `application/x-www-form-urlencoded` parsing and a low-level `zgix.body()` response helper
-- Inline response headers without a middleware/context allocation layer
+- `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start
 
@@ -91,5 +91,46 @@ pub fn main() !void {
     try users.get("/", listUsers);
     try app.route("/users", &users);
     app.notFound(notFound);
+}
+```
+
+### Request Testing
+
+```zig
+const std = @import("std");
+const zgix = @import("zgix");
+
+fn search(req: zgix.Request) zgix.Response {
+    return zgix.text(.ok, req.query("q") orelse "missing");
+}
+
+test "search route" {
+    var app = zgix.App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/search", search);
+
+    var res = try app.request(std.testing.allocator, "/search?q=zig", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("zig", res.body);
+}
+```
+
+### Mounting Prefixed Handlers
+
+```zig
+const std = @import("std");
+const zgix = @import("zgix");
+
+fn legacy(req: zgix.Request) zgix.Response {
+    return zgix.text(.ok, req.path);
+}
+
+pub fn main() !void {
+    var app = zgix.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.mount("/legacy", legacy);
 }
 ```

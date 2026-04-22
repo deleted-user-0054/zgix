@@ -9,8 +9,27 @@ const Router = router_mod.Router;
 const Handler = router_mod.Handler;
 
 pub const App = struct {
+    const Self = @This();
+    const MountTarget = union(enum) {
+        app: *Self,
+        handler: Handler,
+    };
+
+    const Mount = struct {
+        prefix: []const u8,
+        target: MountTarget,
+    };
+
+    pub const RequestOptions = struct {
+        method: std.http.Method = .GET,
+        headers: []const std.http.Header = &.{},
+        body: []const u8 = "",
+        cookies_raw: ?[]const u8 = null,
+    };
+
     allocator: std.mem.Allocator,
     routes: std.ArrayListUnmanaged(Route) = .empty,
+    mounts: std.ArrayListUnmanaged(Mount) = .empty,
     router: ?Router = null,
     finalized: bool = false,
     base_path: []const u8 = "",
@@ -32,6 +51,10 @@ pub const App = struct {
             self.allocator.free(registered_route.path);
         }
         self.routes.deinit(self.allocator);
+        for (self.mounts.items) |mount_entry| {
+            self.allocator.free(mount_entry.prefix);
+        }
+        self.mounts.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -135,6 +158,21 @@ pub const App = struct {
         }
     }
 
+    pub fn mount(self: *App, prefix: []const u8, target: anytype) !void {
+        if (self.finalized) return error.AppFinalized;
+
+        const combined_prefix = try joinPrefixedPath(self.allocator, self.base_path, prefix);
+        defer self.allocator.free(combined_prefix);
+
+        const mounted_prefix = try normalizePrefix(self.allocator, combined_prefix);
+        errdefer self.allocator.free(mounted_prefix);
+
+        try self.mounts.append(self.allocator, .{
+            .prefix = mounted_prefix,
+            .target = resolveMountTarget(target),
+        });
+    }
+
     pub fn notFound(self: *App, handler: Handler) void {
         self.not_found_handler = handler;
     }
@@ -166,6 +204,12 @@ pub const App = struct {
             var routed_req = req;
             routed_req.params = lookup.params;
             return handler(routed_req);
+        }
+
+        if (matchMount(self.mounts.items, req.path)) |matched_mount| {
+            var mounted_req = req;
+            mounted_req.path = matched_mount.path;
+            return dispatchMount(matched_mount.mount.target, mounted_req);
         }
 
         if (self.redirect_trailing_slash and lookup.tsr and !std.mem.eql(u8, req.path, "/")) {
@@ -200,6 +244,50 @@ pub const App = struct {
         }
 
         return response_mod.notFound();
+    }
+
+    pub fn fetch(self: *App, req: Request) Response {
+        return self.handle(req);
+    }
+
+    pub fn request(self: *App, allocator: std.mem.Allocator, input: anytype, req_options: RequestOptions) !Response {
+        const InputType = @TypeOf(input);
+        if (InputType == Request) {
+            return try self.cloneHandledResponse(allocator, input);
+        }
+        if (InputType == *const Request or InputType == *Request) {
+            return try self.cloneHandledResponse(allocator, input.*);
+        }
+        if (!comptime isStringLike(InputType)) {
+            @compileError("App.request input must be a zgix.Request, *zgix.Request, or a string-like target.");
+        }
+
+        const target: []const u8 = input;
+        return try self.requestTarget(allocator, target, req_options);
+    }
+
+    fn requestTarget(self: *App, allocator: std.mem.Allocator, target: []const u8, req_options: RequestOptions) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const temp_allocator = arena.allocator();
+        const split = try splitRequestTarget(temp_allocator, target);
+
+        var req = Request.init(temp_allocator, req_options.method, split.path);
+        req.query_string = split.query_string;
+        req.headers = req_options.headers;
+        req.body = req_options.body;
+        req.cookies_raw = req_options.cookies_raw orelse "";
+
+        var response = self.handle(req);
+        defer response.deinit();
+        return try response.clone(allocator);
+    }
+
+    fn cloneHandledResponse(self: *App, allocator: std.mem.Allocator, req: Request) !Response {
+        var response = self.handle(req);
+        defer response.deinit();
+        return try response.clone(allocator);
     }
 
     fn registerOn(self: *App, methods: anytype, paths: anytype, handler: Handler) !void {
@@ -298,6 +386,11 @@ pub const App = struct {
     }
 };
 
+const MountMatch = struct {
+    mount: *const App.Mount,
+    path: []const u8,
+};
+
 fn trailingSlashVariant(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
     if (path.len <= 1) return null;
 
@@ -358,6 +451,101 @@ fn joinPrefixedPath(allocator: std.mem.Allocator, prefix: []const u8, path: []co
     if (route_path[0] != '/') try out.append(allocator, '/');
     try out.appendSlice(allocator, route_path);
     return try out.toOwnedSlice(allocator);
+}
+
+fn resolveMountTarget(target: anytype) App.MountTarget {
+    const TargetType = @TypeOf(target);
+    if (TargetType == *App) return .{ .app = target };
+    if (TargetType == *const App) return .{ .app = @constCast(target) };
+    if (TargetType == Handler) return .{ .handler = target };
+
+    return switch (comptime @typeInfo(TargetType)) {
+        .@"fn" => .{ .handler = target },
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"fn" => .{ .handler = target },
+            else => @compileError("App.mount target must be a *zgix.App or a compatible handler."),
+        },
+        else => @compileError("App.mount target must be a *zgix.App or a compatible handler."),
+    };
+}
+
+fn dispatchMount(target: App.MountTarget, req: Request) Response {
+    return switch (target) {
+        .app => |mounted_app| mounted_app.handle(req),
+        .handler => |handler| handler(req),
+    };
+}
+
+fn matchMount(mounts: []const App.Mount, path: []const u8) ?MountMatch {
+    var best: ?MountMatch = null;
+
+    for (mounts) |*mount_entry| {
+        const mounted_path = stripMountPrefix(path, mount_entry.prefix) orelse continue;
+        if (best == null or mount_entry.prefix.len > best.?.mount.prefix.len) {
+            best = .{
+                .mount = mount_entry,
+                .path = mounted_path,
+            };
+        }
+    }
+
+    return best;
+}
+
+fn stripMountPrefix(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, prefix, "/")) return path;
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (path.len == prefix.len) return "/";
+    if (path[prefix.len] != '/') return null;
+    return path[prefix.len..];
+}
+
+const SplitTarget = struct {
+    path: []const u8,
+    query_string: []const u8,
+};
+
+fn splitRequestTarget(allocator: std.mem.Allocator, target: []const u8) !SplitTarget {
+    var path_and_query = target;
+
+    if (std.mem.indexOf(u8, target, "://")) |scheme_index| {
+        const authority_start = scheme_index + 3;
+        const path_index = std.mem.indexOfScalarPos(u8, target, authority_start, '/') orelse target.len;
+        const query_index = std.mem.indexOfScalarPos(u8, target, authority_start, '?') orelse target.len;
+        const first_index = @min(path_index, query_index);
+
+        if (first_index == target.len) {
+            path_and_query = "/";
+        } else {
+            path_and_query = target[first_index..];
+        }
+    }
+
+    const query_index = std.mem.indexOfScalar(u8, path_and_query, '?');
+    const raw_path = if (query_index) |index|
+        if (index == 0) "/" else path_and_query[0..index]
+    else if (path_and_query.len == 0)
+        "/"
+    else
+        path_and_query;
+
+    const path = if (raw_path.len > 0 and raw_path[0] == '/')
+        raw_path
+    else blk: {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '/');
+        try out.appendSlice(allocator, raw_path);
+        break :blk try out.toOwnedSlice(allocator);
+    };
+
+    return .{
+        .path = path,
+        .query_string = if (query_index) |index|
+            if (index + 1 < path_and_query.len) path_and_query[index + 1 ..] else ""
+        else
+            "",
+    };
 }
 
 fn isStringLike(comptime T: type) bool {
@@ -473,6 +661,57 @@ test "app basePath and route compose prefixed sub-apps" {
     try std.testing.expectEqualStrings("42", detail_res.body);
 }
 
+test "app mount delegates prefixed requests to mounted apps" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var mounted = App.init(std.testing.allocator);
+    defer mounted.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try mounted.get("/", struct {
+        fn root(_: Request) Response {
+            return response_mod.text(.ok, "mounted root");
+        }
+    }.root);
+    try mounted.get("/hello", struct {
+        fn hello(_: Request) Response {
+            return response_mod.text(.ok, "mounted hello");
+        }
+    }.hello);
+    try app.mount("/nested", &mounted);
+
+    const root_res = app.handle(Request.init(arena.allocator(), .GET, "/nested"));
+    try std.testing.expectEqual(std.http.Status.ok, root_res.status);
+    try std.testing.expectEqualStrings("mounted root", root_res.body);
+
+    const hello_res = app.handle(Request.init(arena.allocator(), .GET, "/nested/hello"));
+    try std.testing.expectEqual(std.http.Status.ok, hello_res.status);
+    try std.testing.expectEqualStrings("mounted hello", hello_res.body);
+}
+
+test "app mount prefers the longest matching prefix" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.mount("/api", struct {
+        fn api(req: Request) Response {
+            return response_mod.text(.ok, req.path);
+        }
+    }.api);
+    try app.mount("/api/admin", struct {
+        fn admin(req: Request) Response {
+            return response_mod.text(.ok, req.path);
+        }
+    }.admin);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/api/admin/users"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("/users", res.body);
+}
+
 test "app on registers multiple methods and paths" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -525,4 +764,85 @@ test "app custom notFound handler overrides default miss response" {
     const res = app.handle(Request.init(arena.allocator(), .GET, "/missing"));
     try std.testing.expectEqual(std.http.Status.not_found, res.status);
     try std.testing.expectEqualStrings("/missing", res.body);
+}
+
+test "app request helper dispatches with query headers and body" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.post("/search", struct {
+        fn run(req: Request) Response {
+            if (!std.mem.eql(u8, req.query("q") orelse "", "zig")) return response_mod.text(.bad_request, "bad query");
+            if (!std.mem.eql(u8, req.header("x-mode") orelse "", "test")) return response_mod.text(.bad_request, "bad header");
+            if (!std.mem.eql(u8, req.text(), "payload")) return response_mod.text(.bad_request, "bad body");
+            return response_mod.text(.ok, "ok");
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/search?q=zig", .{
+        .method = .POST,
+        .headers = &.{.{ .name = "x-mode", .value = "test" }},
+        .body = "payload",
+    });
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("ok", res.body);
+}
+
+test "app request helper accepts absolute urls" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/hello", struct {
+        fn run(req: Request) Response {
+            return response_mod.text(.ok, req.query("name") orelse "missing");
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "https://example.com/hello?name=zgix", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("zgix", res.body);
+}
+
+test "app request helper accepts zgix request values" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.post("/submit", struct {
+        fn run(req: Request) Response {
+            if (!std.mem.eql(u8, req.query("draft") orelse "", "1")) return response_mod.text(.bad_request, "bad query");
+            return response_mod.text(.created, req.text());
+        }
+    }.run);
+
+    var req = Request.init(std.testing.allocator, .POST, "/submit");
+    req.query_string = "draft=1";
+    req.body = "payload";
+
+    var res = try app.request(std.testing.allocator, req, .{});
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.created, res.status);
+    try std.testing.expectEqualStrings("payload", res.body);
+}
+
+test "app fetch aliases handle" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/health", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "ok");
+        }
+    }.run);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const res = app.fetch(Request.init(arena.allocator(), .GET, "/health"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("ok", res.body);
 }

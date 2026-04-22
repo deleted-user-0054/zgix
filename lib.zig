@@ -17,7 +17,14 @@ pub const Router = root.Router;
 pub const Route = root.Route;
 pub const Server = root.Server;
 pub const Options = root.Options;
+pub const AppOptions = root.AppOptions;
 pub const AppRequestOptions = root.AppRequestOptions;
+pub const CookieOptions = root.CookieOptions;
+pub const DeleteCookieOptions = root.DeleteCookieOptions;
+pub const CookieError = root.CookieError;
+pub const SameSite = root.SameSite;
+pub const CookiePriority = root.CookiePriority;
+pub const CookiePrefix = root.CookiePrefix;
 
 pub const html = root.html;
 pub const body = root.body;
@@ -30,6 +37,8 @@ pub const methodNotAllowed = root.methodNotAllowed;
 pub const internalError = root.internalError;
 pub const typedJson = root.typedJson;
 pub const parseJson = root.parseJson;
+pub const generateCookie = root.generateCookie;
+pub const generateDeleteCookie = root.generateDeleteCookie;
 pub const cleanPath = root.cleanPath;
 
 test {

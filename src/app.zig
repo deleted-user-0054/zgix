@@ -27,11 +27,19 @@ pub const App = struct {
         cookies_raw: ?[]const u8 = null,
     };
 
+    pub const Options = struct {
+        strict: bool = true,
+        redirect_fixed_path: bool = true,
+        handle_method_not_allowed: bool = true,
+        handle_options: bool = true,
+    };
+
     allocator: std.mem.Allocator,
     routes: std.ArrayListUnmanaged(Route) = .empty,
     mounts: std.ArrayListUnmanaged(Mount) = .empty,
     router: ?Router = null,
     finalized: bool = false,
+    strict: bool = true,
     base_path: []const u8 = "",
     base_path_owned: ?[]const u8 = null,
     redirect_trailing_slash: bool = true,
@@ -41,7 +49,18 @@ pub const App = struct {
     not_found_handler: ?Handler = null,
 
     pub fn init(allocator: std.mem.Allocator) App {
-        return .{ .allocator = allocator };
+        return initWithOptions(allocator, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, app_options: Options) App {
+        return .{
+            .allocator = allocator,
+            .strict = app_options.strict,
+            .redirect_trailing_slash = app_options.strict,
+            .redirect_fixed_path = app_options.redirect_fixed_path,
+            .handle_method_not_allowed = app_options.handle_method_not_allowed,
+            .handle_options = app_options.handle_options,
+        };
     }
 
     pub fn deinit(self: *App) void {
@@ -147,7 +166,8 @@ pub const App = struct {
         defer self.allocator.free(mounted_prefix);
 
         for (other.routes.items) |nested| {
-            const full_path = try joinPrefixedPath(self.allocator, mounted_prefix, nested.path);
+            const joined_path = try joinPrefixedPath(self.allocator, mounted_prefix, nested.path);
+            const full_path = try canonicalizeOwnedPath(self.allocator, joined_path, self.strict);
             errdefer self.allocator.free(full_path);
 
             try self.routes.append(self.allocator, .{
@@ -179,7 +199,8 @@ pub const App = struct {
 
     pub fn addRoute(self: *App, method: std.http.Method, path: []const u8, handler: Handler) !void {
         if (self.finalized) return error.AppFinalized;
-        const full_path = try joinPrefixedPath(self.allocator, self.base_path, path);
+        const joined_path = try joinPrefixedPath(self.allocator, self.base_path, path);
+        const full_path = try canonicalizeOwnedPath(self.allocator, joined_path, self.strict);
         errdefer self.allocator.free(full_path);
 
         try self.routes.append(self.allocator, .{
@@ -198,7 +219,9 @@ pub const App = struct {
     pub fn handle(self: *App, req: Request) Response {
         if (!self.finalized) self.finalize() catch return response_mod.internalError("router init failed");
         const router = &self.router.?;
-        const lookup = router.lookup(req);
+        var lookup_req = req;
+        lookup_req.path = canonicalPath(req.path, self.strict);
+        const lookup = router.lookup(lookup_req);
         if (lookup.handler) |handler| {
             defer if (lookup.params_owned and lookup.params.len > 0) req.allocator.free(lookup.params);
             var routed_req = req;
@@ -220,7 +243,7 @@ pub const App = struct {
         }
 
         if (self.redirect_fixed_path) {
-            const cleaned = path_mod.cleanPath(req.allocator, req.path) catch req.path;
+            const cleaned = path_mod.cleanPath(req.allocator, lookup_req.path) catch lookup_req.path;
             if (router.findCaseInsensitivePath(req.allocator, req.method, cleaned, true) catch null) |fixed| {
                 const location = appendQuery(req.allocator, fixed, req.query_string) catch fixed;
                 return response_mod.redirect(req.method, location);
@@ -228,13 +251,13 @@ pub const App = struct {
         }
 
         if (req.method == .OPTIONS and self.handle_options) {
-            if (router.allowed(req.allocator, req.path, req.method, self.handle_options) catch null) |allow| {
+            if (router.allowed(req.allocator, lookup_req.path, req.method, self.handle_options) catch null) |allow| {
                 return response_mod.options(allow);
             }
         }
 
         if (self.handle_method_not_allowed) {
-            if (router.allowed(req.allocator, req.path, req.method, self.handle_options) catch null) |allow| {
+            if (router.allowed(req.allocator, lookup_req.path, req.method, self.handle_options) catch null) |allow| {
                 return response_mod.methodNotAllowed(allow);
             }
         }
@@ -453,6 +476,20 @@ fn joinPrefixedPath(allocator: std.mem.Allocator, prefix: []const u8, path: []co
     return try out.toOwnedSlice(allocator);
 }
 
+fn canonicalPath(path: []const u8, strict: bool) []const u8 {
+    if (strict or path.len <= 1 or path[path.len - 1] != '/') return path;
+    return path[0 .. path.len - 1];
+}
+
+fn canonicalizeOwnedPath(allocator: std.mem.Allocator, path: []const u8, strict: bool) ![]const u8 {
+    const canonical = canonicalPath(path, strict);
+    if (canonical.len == path.len) return path;
+
+    const owned = try allocator.dupe(u8, canonical);
+    allocator.free(path);
+    return owned;
+}
+
 fn resolveMountTarget(target: anytype) App.MountTarget {
     const TargetType = @TypeOf(target);
     if (TargetType == *App) return .{ .app = target };
@@ -631,6 +668,53 @@ test "app redirects cleaned and case-corrected paths" {
     const res = app.handle(Request.init(arena.allocator(), .GET, "/..//users/42"));
     try std.testing.expectEqual(std.http.Status.moved_permanently, res.status);
     try std.testing.expectEqualStrings("/Users/42", res.location.?);
+}
+
+test "app strict false treats trailing slash variants as the same route" {
+    var app = App.initWithOptions(std.testing.allocator, .{
+        .strict = false,
+    });
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/health/", struct {
+        fn run(req: Request) Response {
+            return response_mod.text(.ok, req.path);
+        }
+    }.run);
+
+    const no_slash_res = app.handle(Request.init(arena.allocator(), .GET, "/health"));
+    try std.testing.expectEqual(std.http.Status.ok, no_slash_res.status);
+    try std.testing.expectEqualStrings("/health", no_slash_res.body);
+    try std.testing.expect(no_slash_res.location == null);
+
+    const slash_res = app.handle(Request.init(arena.allocator(), .GET, "/health/"));
+    try std.testing.expectEqual(std.http.Status.ok, slash_res.status);
+    try std.testing.expectEqualStrings("/health/", slash_res.body);
+    try std.testing.expect(slash_res.location == null);
+}
+
+test "app options can disable automatic options and 405 handling" {
+    var app = App.initWithOptions(std.testing.allocator, .{
+        .handle_options = false,
+        .handle_method_not_allowed = false,
+    });
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/users", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "users");
+        }
+    }.run);
+
+    const options_res = app.handle(Request.init(arena.allocator(), .OPTIONS, "/users"));
+    try std.testing.expectEqual(std.http.Status.not_found, options_res.status);
+
+    const post_res = app.handle(Request.init(arena.allocator(), .POST, "/users"));
+    try std.testing.expectEqual(std.http.Status.not_found, post_res.status);
 }
 
 test "app basePath and route compose prefixed sub-apps" {

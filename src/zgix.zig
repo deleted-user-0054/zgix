@@ -15,7 +15,14 @@ pub const Router = router.Router;
 pub const Route = router.Route;
 pub const Server = server.Server;
 pub const Options = server.Options;
+pub const AppOptions = app.App.Options;
 pub const AppRequestOptions = app.App.RequestOptions;
+pub const CookieOptions = response.CookieOptions;
+pub const DeleteCookieOptions = response.DeleteCookieOptions;
+pub const CookieError = response.CookieError;
+pub const SameSite = response.SameSite;
+pub const CookiePriority = response.CookiePriority;
+pub const CookiePrefix = response.CookiePrefix;
 
 pub const html = response.html;
 pub const body = response.body;
@@ -28,6 +35,8 @@ pub const methodNotAllowed = response.methodNotAllowed;
 pub const internalError = response.internalError;
 pub const typedJson = response.typedJson;
 pub const parseJson = response.parseJson;
+pub const generateCookie = response.generateCookie;
+pub const generateDeleteCookie = response.generateDeleteCookie;
 pub const cleanPath = path.cleanPath;
 
 test {

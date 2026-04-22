@@ -1,5 +1,52 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
+const EpochSeconds = std.time.epoch.EpochSeconds;
+
+pub const SameSite = enum {
+    strict,
+    lax,
+    none,
+};
+
+pub const CookiePriority = enum {
+    low,
+    medium,
+    high,
+};
+
+pub const CookiePrefix = enum {
+    secure,
+    host,
+};
+
+pub const CookieOptions = struct {
+    domain: ?[]const u8 = null,
+    expires: ?EpochSeconds = null,
+    http_only: bool = false,
+    max_age: ?u64 = null,
+    path: ?[]const u8 = "/",
+    secure: bool = false,
+    same_site: ?SameSite = null,
+    priority: ?CookiePriority = null,
+    prefix: ?CookiePrefix = null,
+    partitioned: bool = false,
+};
+
+pub const DeleteCookieOptions = struct {
+    domain: ?[]const u8 = null,
+    path: ?[]const u8 = "/",
+    secure: bool = false,
+    prefix: ?CookiePrefix = null,
+};
+
+pub const CookieError = std.mem.Allocator.Error || error{
+    InvalidCookieName,
+    InvalidCookieValue,
+    SecurePrefixRequiresSecure,
+    HostPrefixRequiresSecure,
+    HostPrefixRequiresPathRoot,
+    HostPrefixDisallowsDomain,
+};
 
 pub const Response = struct {
     status: std.http.Status,
@@ -13,15 +60,15 @@ pub const Response = struct {
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
-            self.content_type = value;
+            self.replaceSlice(&self.content_type, value) catch return false;
             return true;
         }
         if (std.ascii.eqlIgnoreCase(name, "location")) {
-            self.location = value;
+            self.replaceOptionalSlice(&self.location, value) catch return false;
             return true;
         }
         if (std.ascii.eqlIgnoreCase(name, "allow")) {
-            self.allow = value;
+            self.replaceOptionalSlice(&self.allow, value) catch return false;
             return true;
         }
         if (std.ascii.eqlIgnoreCase(name, "set-cookie")) {
@@ -30,7 +77,7 @@ pub const Response = struct {
 
         for (self.extra_headers.items) |*entry| {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) {
-                entry.* = .{ .name = name, .value = value };
+                self.replaceHeader(entry, name, value) catch return false;
                 return true;
             }
         }
@@ -39,17 +86,75 @@ pub const Response = struct {
     }
 
     pub fn appendHeader(self: *Response, name: []const u8, value: []const u8) bool {
-        const allocator = self.extra_headers_allocator orelse std.heap.smp_allocator;
-        self.extra_headers.append(allocator, .{
+        if (self.owned_allocator) |allocator| {
+            const owned_name = allocator.dupe(u8, name) catch return false;
+            errdefer allocator.free(owned_name);
+            const owned_value = allocator.dupe(u8, value) catch return false;
+            errdefer allocator.free(owned_value);
+
+            const list_allocator = self.extra_headers_allocator orelse allocator;
+            self.extra_headers.append(list_allocator, .{
+                .name = owned_name,
+                .value = owned_value,
+            }) catch return false;
+            self.extra_headers_allocator = list_allocator;
+            return true;
+        }
+
+        const list_allocator = self.extra_headers_allocator orelse std.heap.smp_allocator;
+        self.extra_headers.append(list_allocator, .{
             .name = name,
             .value = value,
         }) catch return false;
-        self.extra_headers_allocator = allocator;
+        self.extra_headers_allocator = list_allocator;
         return true;
     }
 
     pub fn extraHeaders(self: *const Response) []const std.http.Header {
         return self.extra_headers.items;
+    }
+
+    pub fn cookie(
+        self: *Response,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        value: []const u8,
+        cookie_options: CookieOptions,
+    ) CookieError!void {
+        try self.ensureOwned(allocator);
+
+        const owned_name = try allocator.dupe(u8, "set-cookie");
+        errdefer allocator.free(owned_name);
+        const owned_value = try generateCookie(allocator, name, value, cookie_options);
+        errdefer allocator.free(owned_value);
+
+        const list_allocator = self.extra_headers_allocator orelse allocator;
+        try self.extra_headers.append(list_allocator, .{
+            .name = owned_name,
+            .value = owned_value,
+        });
+        self.extra_headers_allocator = list_allocator;
+    }
+
+    pub fn deleteCookie(
+        self: *Response,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        delete_options: DeleteCookieOptions,
+    ) CookieError!void {
+        try self.ensureOwned(allocator);
+
+        const owned_name = try allocator.dupe(u8, "set-cookie");
+        errdefer allocator.free(owned_name);
+        const owned_value = try generateDeleteCookie(allocator, name, delete_options);
+        errdefer allocator.free(owned_value);
+
+        const list_allocator = self.extra_headers_allocator orelse allocator;
+        try self.extra_headers.append(list_allocator, .{
+            .name = owned_name,
+            .value = owned_value,
+        });
+        self.extra_headers_allocator = list_allocator;
     }
 
     pub fn clone(self: Response, allocator: std.mem.Allocator) !Response {
@@ -93,7 +198,169 @@ pub const Response = struct {
         self.extra_headers_allocator = null;
         self.owned_allocator = null;
     }
+
+    fn ensureOwned(self: *Response, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (self.owned_allocator != null) return;
+
+        const owned_content_type = try allocator.dupe(u8, self.content_type);
+        errdefer allocator.free(owned_content_type);
+        const owned_body = try allocator.dupe(u8, self.body);
+        errdefer allocator.free(owned_body);
+        const owned_location = if (self.location) |location| try allocator.dupe(u8, location) else null;
+        errdefer if (owned_location) |location| allocator.free(location);
+        const owned_allow = if (self.allow) |allow| try allocator.dupe(u8, allow) else null;
+        errdefer if (owned_allow) |allow| allocator.free(allow);
+
+        var owned_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
+        errdefer {
+            for (owned_headers.items) |owned_header| {
+                allocator.free(owned_header.name);
+                allocator.free(owned_header.value);
+            }
+            owned_headers.deinit(allocator);
+        }
+
+        for (self.extra_headers.items) |extra_header| {
+            const owned_name = try allocator.dupe(u8, extra_header.name);
+            errdefer allocator.free(owned_name);
+            const owned_value = try allocator.dupe(u8, extra_header.value);
+            errdefer allocator.free(owned_value);
+            try owned_headers.append(allocator, .{
+                .name = owned_name,
+                .value = owned_value,
+            });
+        }
+
+        if (self.extra_headers_allocator) |list_allocator| {
+            self.extra_headers.deinit(list_allocator);
+        }
+
+        self.content_type = owned_content_type;
+        self.body = owned_body;
+        self.location = owned_location;
+        self.allow = owned_allow;
+        self.extra_headers = owned_headers;
+        self.extra_headers_allocator = allocator;
+        self.owned_allocator = allocator;
+    }
+
+    fn replaceSlice(self: *Response, field: *[]const u8, value: []const u8) std.mem.Allocator.Error!void {
+        if (self.owned_allocator) |allocator| {
+            const owned_value = try allocator.dupe(u8, value);
+            allocator.free(field.*);
+            field.* = owned_value;
+            return;
+        }
+        field.* = value;
+    }
+
+    fn replaceOptionalSlice(self: *Response, field: *?[]const u8, value: []const u8) std.mem.Allocator.Error!void {
+        if (self.owned_allocator) |allocator| {
+            const owned_value = try allocator.dupe(u8, value);
+            if (field.*) |existing| allocator.free(existing);
+            field.* = owned_value;
+            return;
+        }
+        field.* = value;
+    }
+
+    fn replaceHeader(
+        self: *Response,
+        entry: *std.http.Header,
+        name: []const u8,
+        value: []const u8,
+    ) std.mem.Allocator.Error!void {
+        if (self.owned_allocator) |allocator| {
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
+            const owned_value = try allocator.dupe(u8, value);
+            errdefer allocator.free(owned_value);
+
+            allocator.free(entry.name);
+            allocator.free(entry.value);
+            entry.* = .{
+                .name = owned_name,
+                .value = owned_value,
+            };
+            return;
+        }
+
+        entry.* = .{
+            .name = name,
+            .value = value,
+        };
+    }
 };
+
+pub fn generateCookie(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    value: []const u8,
+    cookie_options: CookieOptions,
+) CookieError![]const u8 {
+    try validateCookieName(name);
+    try validateCookieValue(value);
+    try validateCookieOptions(name, cookie_options);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try appendCookieName(&out, name, cookie_options.prefix);
+    try writeByteAllocating(&out, '=');
+    try writeAllAllocating(&out, value);
+
+    if (cookie_options.path) |path| {
+        try writeAllAllocating(&out, "; Path=");
+        try writeAllAllocating(&out, path);
+    }
+    if (cookie_options.domain) |domain| {
+        try writeAllAllocating(&out, "; Domain=");
+        try writeAllAllocating(&out, domain);
+    }
+    if (cookie_options.max_age) |max_age| {
+        try printAllocating(&out, "; Max-Age={d}", .{max_age});
+    }
+    if (cookie_options.expires) |expires| {
+        const formatted = try formatCookieExpires(allocator, expires);
+        defer allocator.free(formatted);
+        try writeAllAllocating(&out, "; Expires=");
+        try writeAllAllocating(&out, formatted);
+    }
+    if (cookie_options.http_only) {
+        try writeAllAllocating(&out, "; HttpOnly");
+    }
+    if (cookie_options.secure) {
+        try writeAllAllocating(&out, "; Secure");
+    }
+    if (cookie_options.same_site) |same_site| {
+        try writeAllAllocating(&out, "; SameSite=");
+        try writeAllAllocating(&out, sameSiteName(same_site));
+    }
+    if (cookie_options.priority) |priority| {
+        try writeAllAllocating(&out, "; Priority=");
+        try writeAllAllocating(&out, priorityName(priority));
+    }
+    if (cookie_options.partitioned) {
+        try writeAllAllocating(&out, "; Partitioned");
+    }
+
+    return try out.toOwnedSlice();
+}
+
+pub fn generateDeleteCookie(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    delete_options: DeleteCookieOptions,
+) CookieError![]const u8 {
+    return try generateCookie(allocator, name, "", .{
+        .domain = delete_options.domain,
+        .expires = .{ .secs = 0 },
+        .max_age = 0,
+        .path = delete_options.path,
+        .secure = delete_options.secure,
+        .prefix = delete_options.prefix,
+    });
+}
 
 pub fn body(status: std.http.Status, content_type: []const u8, content: []const u8) Response {
     return .{
@@ -161,6 +428,135 @@ pub fn parseJson(comptime T: type, req: Request) !?std.json.Parsed(T) {
     return try req.json(T);
 }
 
+fn validateCookieOptions(name: []const u8, cookie_options: CookieOptions) CookieError!void {
+    switch (cookie_options.prefix orelse return) {
+        .secure => {
+            if (!cookie_options.secure) return error.SecurePrefixRequiresSecure;
+        },
+        .host => {
+            if (!cookie_options.secure) return error.HostPrefixRequiresSecure;
+            if (cookie_options.domain != null) return error.HostPrefixDisallowsDomain;
+            if (!std.mem.eql(u8, cookie_options.path orelse "", "/")) return error.HostPrefixRequiresPathRoot;
+        },
+    }
+
+    _ = name;
+}
+
+fn validateCookieName(name: []const u8) CookieError!void {
+    if (name.len == 0) return error.InvalidCookieName;
+
+    for (name) |byte| {
+        switch (byte) {
+            0...32, 127 => return error.InvalidCookieName,
+            '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}' => return error.InvalidCookieName,
+            else => {},
+        }
+    }
+}
+
+fn validateCookieValue(value: []const u8) CookieError!void {
+    for (value) |byte| {
+        switch (byte) {
+            0...32, 127, ';', ',', '"', '\\' => return error.InvalidCookieValue,
+            else => {},
+        }
+    }
+}
+
+fn appendCookieName(
+    out: *std.Io.Writer.Allocating,
+    name: []const u8,
+    prefix: ?CookiePrefix,
+) std.mem.Allocator.Error!void {
+    switch (prefix orelse {
+        try writeAllAllocating(out, name);
+        return;
+    }) {
+        .secure => try writeAllAllocating(out, "__Secure-"),
+        .host => try writeAllAllocating(out, "__Host-"),
+    }
+    try writeAllAllocating(out, name);
+}
+
+fn writeAllAllocating(out: *std.Io.Writer.Allocating, bytes: []const u8) std.mem.Allocator.Error!void {
+    out.writer.writeAll(bytes) catch unreachable;
+}
+
+fn writeByteAllocating(out: *std.Io.Writer.Allocating, byte: u8) std.mem.Allocator.Error!void {
+    out.writer.writeByte(byte) catch unreachable;
+}
+
+fn printAllocating(
+    out: *std.Io.Writer.Allocating,
+    comptime fmt: []const u8,
+    args: anytype,
+) std.mem.Allocator.Error!void {
+    out.writer.print(fmt, args) catch unreachable;
+}
+
+fn formatCookieExpires(allocator: std.mem.Allocator, expires: EpochSeconds) std.mem.Allocator.Error![]const u8 {
+    const weekday_names = [_][]const u8{
+        "Sun",
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+    };
+    const month_names = [_][]const u8{
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    };
+
+    const epoch_day = expires.getEpochDay();
+    const day_seconds = expires.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const weekday_index: usize = @intCast((epoch_day.day + 4) % 7);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT",
+        .{
+            weekday_names[weekday_index],
+            month_day.day_index + 1,
+            month_names[@intFromEnum(month_day.month) - 1],
+            year_day.year,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+}
+
+fn sameSiteName(same_site: SameSite) []const u8 {
+    return switch (same_site) {
+        .strict => "Strict",
+        .lax => "Lax",
+        .none => "None",
+    };
+}
+
+fn priorityName(priority: CookiePriority) []const u8 {
+    return switch (priority) {
+        .low => "Low",
+        .medium => "Medium",
+        .high => "High",
+    };
+}
+
 test "typedJson serializes into response body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -207,6 +603,67 @@ test "response body helper builds arbitrary content types" {
     try std.testing.expectEqualStrings("{\"ok\":false}", res.body);
 }
 
+test "generateCookie formats common attributes" {
+    const cookie = try generateCookie(std.testing.allocator, "session", "abc123", .{
+        .domain = "example.com",
+        .http_only = true,
+        .max_age = 3600,
+        .path = "/",
+        .priority = .high,
+        .same_site = .strict,
+        .secure = true,
+        .partitioned = true,
+    });
+    defer std.testing.allocator.free(cookie);
+
+    try std.testing.expectEqualStrings(
+        "session=abc123; Path=/; Domain=example.com; Max-Age=3600; HttpOnly; Secure; SameSite=Strict; Priority=High; Partitioned",
+        cookie,
+    );
+}
+
+test "generateDeleteCookie emits an expired cookie header value" {
+    const cookie = try generateDeleteCookie(std.testing.allocator, "session", .{});
+    defer std.testing.allocator.free(cookie);
+
+    try std.testing.expectEqualStrings(
+        "session=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        cookie,
+    );
+}
+
+test "generateCookie validates host prefix requirements" {
+    try std.testing.expectError(
+        error.HostPrefixRequiresSecure,
+        generateCookie(std.testing.allocator, "session", "abc123", .{
+            .prefix = .host,
+        }),
+    );
+}
+
+test "response cookie helpers append set-cookie headers" {
+    var res = text(.ok, "ok");
+    defer res.deinit();
+
+    try res.cookie(std.testing.allocator, "session", "abc123", .{
+        .http_only = true,
+        .secure = true,
+    });
+    try res.deleteCookie(std.testing.allocator, "theme", .{});
+
+    const headers = res.extraHeaders();
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings("set-cookie", headers[0].name);
+    try std.testing.expectEqualStrings(
+        "session=abc123; Path=/; HttpOnly; Secure",
+        headers[0].value,
+    );
+    try std.testing.expectEqualStrings(
+        "theme=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        headers[1].value,
+    );
+}
+
 test "response clone owns duplicated data" {
     var res = text(.accepted, "ok");
     try std.testing.expect(res.header("cache-control", "no-store"));
@@ -222,4 +679,26 @@ test "response clone owns duplicated data" {
     try std.testing.expectEqual(@as(usize, 2), cloned.extraHeaders().len);
     try std.testing.expectEqualStrings("no-store", cloned.extraHeaders()[0].value);
     try std.testing.expectEqualStrings("a=1", cloned.extraHeaders()[1].value);
+}
+
+test "response clone stays safe to mutate after cloning" {
+    var res = text(.ok, "ok");
+    defer res.deinit();
+
+    var cloned = try res.clone(std.testing.allocator);
+    defer cloned.deinit();
+
+    try std.testing.expect(cloned.header("content-type", "application/problem+json"));
+    try std.testing.expect(cloned.header("cache-control", "no-store"));
+    try cloned.cookie(std.testing.allocator, "session", "abc123", .{
+        .http_only = true,
+    });
+
+    try std.testing.expectEqualStrings("application/problem+json", cloned.content_type);
+    try std.testing.expectEqual(@as(usize, 2), cloned.extraHeaders().len);
+    try std.testing.expectEqualStrings("no-store", cloned.extraHeaders()[0].value);
+    try std.testing.expectEqualStrings(
+        "session=abc123; Path=/; HttpOnly",
+        cloned.extraHeaders()[1].value,
+    );
 }

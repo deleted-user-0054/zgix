@@ -8,9 +8,10 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Explicit route registration through `zgix.App`
 - Exact-path plus dynamic-parameter routing through `zgix.Router`
 - Hono-inspired route composition with `basePath()`, `route()`, `mount()`, `on()`, and `all()`
+- Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zgix.Server`
 - Request helpers for params, query strings, headers, cookies, and typed JSON parsing
-- `application/x-www-form-urlencoded` parsing and a low-level `zgix.body()` response helper
+- `application/x-www-form-urlencoded` parsing, `Response.cookie()`, and a low-level `zgix.body()` response helper
 - `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start
@@ -132,5 +133,36 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.mount("/legacy", legacy);
+}
+```
+
+### Configuring Strict Routing
+
+```zig
+const std = @import("std");
+const zgix = @import("zgix");
+
+pub fn main() !void {
+    var app = zgix.App.initWithOptions(std.heap.page_allocator, .{
+        .strict = false,
+        .handle_options = false,
+    });
+    defer app.deinit();
+}
+```
+
+### Setting Cookies
+
+```zig
+const zgix = @import("zgix");
+
+fn login(req: zgix.Request) zgix.Response {
+    var res = zgix.text(.ok, "ok");
+    res.cookie(req.allocator, "session", "abc123", .{
+        .http_only = true,
+        .secure = true,
+        .same_site = .lax,
+    }) catch return zgix.internalError("cookie write failed");
+    return res;
 }
 ```

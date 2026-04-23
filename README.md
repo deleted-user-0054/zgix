@@ -97,9 +97,9 @@ Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 <!-- BENCH:START -->
 | Metric | **zono** | **merjs** |
 |--------|----------|-----------|
-| Requests/sec (wrk median) | **102636.20** | **85440.00** |
-| Avg latency | **613.84us 1.88ms** | **695.11us 760.79us** |
-| RAM usage (under load) | **473.0 MB** | **3.2 MB** |
+| Requests/sec (wrk median) | **104659.77** | **85762.73** |
+| Avg latency | **614.40us 2.04ms** | **684.24us 710.21us** |
+| RAM usage (under load) | **473.5 MB** | **3.2 MB** |
 <!-- BENCH:END -->
 
 ## At a glance

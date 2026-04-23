@@ -196,9 +196,36 @@ fn runConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancel
         const alloc = arena.allocator();
 
         var raw_req = http_server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing, error.ReadFailed => break,
-            else => break,
+            error.HttpConnectionClosing, error.ReadFailed, error.HttpRequestTruncated => break,
+            // Header oversize / malformed → 431/400 if we still can, then close.
+            error.HttpHeadersOversize => {
+                writeStatusLineAndClose(&writer.interface, .request_header_fields_too_large) catch {};
+                break;
+            },
+            error.HttpHeadersInvalid => {
+                writeStatusLineAndClose(&writer.interface, .bad_request) catch {};
+                break;
+            },
         };
+
+        // --- Expect: 100-continue handling ---
+        // RFC 7231 §5.1.1: a server MUST respond with either 100 Continue
+        // (so the client sends the body) or a final status (typically 417).
+        // We accept only the literal "100-continue" token; anything else
+        // gets 417 Expectation Failed and the connection is closed.
+        if (raw_req.head.expect) |expect_value| {
+            if (std.ascii.eqlIgnoreCase(expect_value, "100-continue")) {
+                raw_req.server.out.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch break;
+                raw_req.server.out.flush() catch break;
+                raw_req.head.expect = null;
+            } else {
+                // std.http.Server.Request.respond asserts head.expect == null
+                // and otherwise refuses to write a final status. Bypass it by
+                // emitting a minimal 417 directly on the underlying writer.
+                writeStatusLineAndClose(&writer.interface, .expectation_failed) catch {};
+                break;
+            }
+        }
 
         const target = raw_req.head.target;
         const query_index = std.mem.indexOfScalar(u8, target, '?');
@@ -209,22 +236,26 @@ fn runConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancel
             "";
 
         // --- Body read with explicit 413 path ---
+        // We read the body whenever the request announces one, regardless of
+        // framing (Content-Length OR Transfer-Encoding: chunked). Reading
+        // chunked-but-ignored bodies is critical: leaving bytes on the wire
+        // would desync the next keep-alive request.
         var body: []const u8 = "";
         var body_too_large = false;
-        if (raw_req.head.content_length) |content_length| {
-            if (content_length > 0) {
-                var transfer_buffer: [4096]u8 = undefined;
-                var body_reader = raw_req.server.reader.bodyReader(
-                    &transfer_buffer,
-                    raw_req.head.transfer_encoding,
-                    raw_req.head.content_length,
-                );
-                if (body_reader.allocRemaining(alloc, .limited(options.max_body_bytes))) |bytes| {
-                    body = bytes;
-                } else |err| switch (err) {
-                    error.StreamTooLong => body_too_large = true,
-                    else => break, // network failure, drop connection
-                }
+        const has_body = raw_req.head.transfer_encoding == .chunked or
+            (raw_req.head.content_length orelse 0) > 0;
+        if (has_body) {
+            var transfer_buffer: [4096]u8 = undefined;
+            var body_reader = raw_req.server.reader.bodyReader(
+                &transfer_buffer,
+                raw_req.head.transfer_encoding,
+                raw_req.head.content_length,
+            );
+            if (body_reader.allocRemaining(alloc, .limited(options.max_body_bytes))) |bytes| {
+                body = bytes;
+            } else |err| switch (err) {
+                error.StreamTooLong => body_too_large = true,
+                else => break, // network failure, drop connection
             }
         }
 
@@ -258,6 +289,18 @@ const SendOutcome = enum {
     keep_alive,
     upgraded,
 };
+
+/// Writes a minimal HTTP/1.1 status line + Connection: close + empty body.
+/// Used when receiveHead fails before we have a Request struct to call
+/// .respond on. The caller is expected to break out of the keep-alive loop
+/// after this returns.
+fn writeStatusLineAndClose(out: *std.Io.Writer, status: std.http.Status) !void {
+    const phrase = status.phrase() orelse "Error";
+    try out.print("HTTP/1.1 {d} {s}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n", .{
+        @intFromEnum(status), phrase,
+    });
+    try out.flush();
+}
 
 fn sendResponse(
     raw_req: *std.http.Server.Request,
@@ -633,5 +676,437 @@ test "PR2: StreamWriter.isAborted reflects atomic flag" {
     try testing.expect(!sw.isAborted());
     aborted.store(true, .release);
     try testing.expect(sw.isAborted());
+}
+
+// ---------------------------------------------------------------------------
+// PR3: HTTP/1.1 protocol correctness
+// ---------------------------------------------------------------------------
+
+/// Sends `request_bytes` on a persistent connection and reads the next
+/// response (parsed via std.http.Server.Response framing rules: headers up
+/// to CRLFCRLF + Content-Length body). Leaves the stream open so callers
+/// can pipeline more requests.
+const PersistentClient = struct {
+    stream: Io.net.Stream,
+    io: Io,
+    read_buf: [16 * 1024]u8 = undefined,
+    write_buf: [4096]u8 = undefined,
+    reader: Io.net.Stream.Reader = undefined,
+    writer: Io.net.Stream.Writer = undefined,
+
+    fn connect(io: Io, port: u16) !*PersistentClient {
+        const c = try testing.allocator.create(PersistentClient);
+        errdefer testing.allocator.destroy(c);
+        c.* = .{ .stream = undefined, .io = io };
+        var addr = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+        addr.setPort(port);
+        c.stream = try addr.connect(io, .{ .mode = .stream });
+        c.reader = Io.net.Stream.Reader.init(c.stream, io, &c.read_buf);
+        c.writer = Io.net.Stream.Writer.init(c.stream, io, &c.write_buf);
+        return c;
+    }
+
+    fn close(c: *PersistentClient) void {
+        c.stream.close(c.io);
+        testing.allocator.destroy(c);
+    }
+
+    fn send(c: *PersistentClient, bytes: []const u8) !void {
+        try c.writer.interface.writeAll(bytes);
+        try c.writer.interface.flush();
+    }
+
+    /// Reads a complete HTTP response (status line + headers + body sized by
+    /// Content-Length or chunked terminator). Returns owned bytes.
+    fn recvResponse(c: *PersistentClient) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(testing.allocator);
+        const r = &c.reader.interface;
+
+        // Read header block.
+        while (std.mem.indexOf(u8, out.items, "\r\n\r\n") == null) {
+            const chunk = r.peekGreedy(1) catch |err| switch (err) {
+                error.EndOfStream => if (out.items.len > 0)
+                    return out.toOwnedSlice(testing.allocator)
+                else
+                    return error.ResponseTruncated,
+                else => return err,
+            };
+            if (chunk.len == 0) return error.ResponseTruncated;
+            try out.appendSlice(testing.allocator, chunk);
+            r.toss(chunk.len);
+            if (out.items.len > 32 * 1024) return error.ResponseTooLarge;
+        }
+
+        const header_end = std.mem.indexOf(u8, out.items, "\r\n\r\n").? + 4;
+        const headers_view = out.items[0..header_end];
+
+        // Parse Content-Length.
+        var body_remaining: ?usize = null;
+        var is_chunked = false;
+        var line_iter = std.mem.splitSequence(u8, headers_view, "\r\n");
+        _ = line_iter.next(); // status line
+        while (line_iter.next()) |line| {
+            if (line.len == 0) break;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = line[0..colon];
+            var value = line[colon + 1 ..];
+            value = std.mem.trim(u8, value, " \t");
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                body_remaining = std.fmt.parseInt(usize, value, 10) catch null;
+            } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                if (std.ascii.indexOfIgnoreCase(value, "chunked") != null) is_chunked = true;
+            }
+        }
+
+        const already_body = out.items.len - header_end;
+
+        if (is_chunked) {
+            // Read until we see the terminating "0\r\n\r\n".
+            while (std.mem.indexOf(u8, out.items[header_end..], "0\r\n\r\n") == null) {
+                const chunk = r.peekGreedy(1) catch |err| switch (err) {
+                    error.EndOfStream => return out.toOwnedSlice(testing.allocator),
+                    else => return err,
+                };
+                if (chunk.len == 0) break;
+                try out.appendSlice(testing.allocator, chunk);
+                r.toss(chunk.len);
+                if (out.items.len > 256 * 1024) return error.ResponseTooLarge;
+            }
+        } else if (body_remaining) |total| {
+            var have = already_body;
+            while (have < total) {
+                const chunk = r.peekGreedy(1) catch |err| switch (err) {
+                    error.EndOfStream => return out.toOwnedSlice(testing.allocator),
+                    else => return err,
+                };
+                if (chunk.len == 0) break;
+                const want = @min(total - have, chunk.len);
+                try out.appendSlice(testing.allocator, chunk[0..want]);
+                r.toss(want);
+                have += want;
+            }
+        }
+
+        return out.toOwnedSlice(testing.allocator);
+    }
+};
+
+fn boot(io: Io, app: *App, opts: Options) !struct {
+    server: *Server,
+    future: Io.Future(anyerror!void),
+} {
+    const server = try testing.allocator.create(Server);
+    server.* = Server.init(opts);
+    var future = try Io.concurrent(io, runServe, .{ server, io, app });
+    _ = waitForBind(server, io) catch |err| {
+        _ = future.await(io) catch {};
+        testing.allocator.destroy(server);
+        return err;
+    };
+    return .{ .server = server, .future = future };
+}
+
+fn shutdown(handle: anytype, io: Io) void {
+    var f = handle.future;
+    stopAndJoin(handle.server, io, &f);
+    testing.allocator.destroy(handle.server);
+}
+
+test "PR3: client Connection: close closes after one response" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/", helloHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const client = try PersistentClient.connect(io, port);
+    defer client.close();
+
+    try client.send(
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    const resp = try client.recvResponse();
+    defer testing.allocator.free(resp);
+
+    try testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+    try testing.expect(std.ascii.indexOfIgnoreCase(resp, "connection: close") != null);
+}
+
+test "PR3: HTTP/1.0 closes by default, keeps alive when requested" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/", helloHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+
+    // 1.0 default: server should not say "keep-alive".
+    {
+        const c = try PersistentClient.connect(io, port);
+        defer c.close();
+        try c.send("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+        const resp = try c.recvResponse();
+        defer testing.allocator.free(resp);
+        try testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+        try testing.expect(std.ascii.indexOfIgnoreCase(resp, "connection: keep-alive") == null);
+    }
+
+    // 1.0 with explicit keep-alive: server should NOT close the connection.
+    // (std promotes the response to HTTP/1.1 and relies on the absence of a
+    // `connection: close` header to signal persistence; it does not echo
+    // `connection: keep-alive` back.)
+    {
+        const c = try PersistentClient.connect(io, port);
+        defer c.close();
+        try c.send("GET / HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+        const resp = try c.recvResponse();
+        defer testing.allocator.free(resp);
+        try testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+        try testing.expect(std.ascii.indexOfIgnoreCase(resp, "connection: close") == null);
+    }
+}
+
+test "PR3: chunked request body is read and delivered to handler" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const c = try PersistentClient.connect(io, port);
+    defer c.close();
+
+    // "Hello, " + "World!" sent as two chunks.
+    try c.send(
+        "POST /echo HTTP/1.1\r\n" ++
+            "Host: x\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "7\r\nHello, \r\n" ++
+            "6\r\nWorld!\r\n" ++
+            "0\r\n\r\n",
+    );
+    const resp = try c.recvResponse();
+    defer testing.allocator.free(resp);
+
+    try testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "Hello, World!") != null);
+}
+
+test "PR3: Expect: 100-continue gets 100 then final response" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const c = try PersistentClient.connect(io, port);
+    defer c.close();
+
+    // Send headers first; expect server to respond with 100 Continue.
+    try c.send(
+        "POST /echo HTTP/1.1\r\n" ++
+            "Host: x\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Expect: 100-continue\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+    );
+
+    const continue_resp = try c.recvResponse();
+    defer testing.allocator.free(continue_resp);
+    try testing.expect(std.mem.startsWith(u8, continue_resp, "HTTP/1.1 100"));
+
+    // Now send the body; expect 200 with echo.
+    try c.send("hello");
+    const final_resp = try c.recvResponse();
+    defer testing.allocator.free(final_resp);
+    try testing.expect(std.mem.indexOf(u8, final_resp, "200") != null);
+    try testing.expect(std.mem.indexOf(u8, final_resp, "\r\n\r\nhello") != null);
+}
+
+test "PR3: unknown Expect value returns 417" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const c = try PersistentClient.connect(io, port);
+    defer c.close();
+
+    try c.send(
+        "POST /echo HTTP/1.1\r\n" ++
+            "Host: x\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Expect: i-want-magic\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+    );
+
+    const resp = try c.recvResponse();
+    defer testing.allocator.free(resp);
+    try testing.expect(std.mem.indexOf(u8, resp, "417") != null);
+}
+
+test "PR3: handler that ignores body still keeps connection alive" {
+    // Verifies std.http.Server.discardBody runs inside respond() and drains
+    // the unread body so a second pipelined request frames correctly.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    // POST handler returns "ok" without ever touching c.req.body.
+    try app.post("/drop", struct {
+        fn h(c: *Context) Response {
+            return c.text("ok");
+        }
+    }.h);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+        // Force the body read path to actually pull bytes off the wire by
+        // making the body real (server reads then discards via respond).
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const c = try PersistentClient.connect(io, port);
+    defer c.close();
+
+    // Two pipelined requests on the same connection. The second must succeed.
+    try c.send(
+        "POST /drop HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello" ++
+            "POST /drop HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nworld",
+    );
+
+    const r1 = try c.recvResponse();
+    defer testing.allocator.free(r1);
+    try testing.expect(std.mem.indexOf(u8, r1, "200") != null);
+
+    const r2 = try c.recvResponse();
+    defer testing.allocator.free(r2);
+    try testing.expect(std.mem.indexOf(u8, r2, "200") != null);
+}
+
+test "PR3: oversize headers return 431" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/", helloHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .read_buffer_size = 1024, // small head buffer to trigger oversize
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const c = try PersistentClient.connect(io, port);
+    defer c.close();
+
+    // Build a request with a single header value larger than the head buffer.
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'A');
+    var req_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer req_buf.deinit(testing.allocator);
+    try req_buf.appendSlice(testing.allocator, "GET / HTTP/1.1\r\nHost: x\r\nX-Big: ");
+    try req_buf.appendSlice(testing.allocator, &big);
+    try req_buf.appendSlice(testing.allocator, "\r\nConnection: close\r\n\r\n");
+
+    try c.send(req_buf.items);
+    const resp = try c.recvResponse();
+    defer testing.allocator.free(resp);
+    try testing.expect(std.mem.indexOf(u8, resp, "431") != null);
+}
+
+test "PR3: 405 returned for wrong method on existing route" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/only-get", helloHandler);
+
+    const handle = try boot(io, &app, .{
+        .address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        .request_timeout_ms = 5_000,
+        .shutdown_drain_ms = 200,
+    });
+    defer shutdown(handle, io);
+
+    const port = handle.server.bound_port.load(.acquire);
+    const c = try PersistentClient.connect(io, port);
+    defer c.close();
+
+    try c.send(
+        "POST /only-get HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    const resp = try c.recvResponse();
+    defer testing.allocator.free(resp);
+    try testing.expect(std.mem.indexOf(u8, resp, "405") != null);
+    try testing.expect(std.ascii.indexOfIgnoreCase(resp, "allow:") != null);
 }
 

@@ -129,13 +129,15 @@ which are filled in for you.
 
 ### Platform notes
 
-zono's own WS test suite skips four roundtrip tests on Windows due to
-a known IOCP edge case in `std.Io.Threaded` where same-process
-client/server reads occasionally surface a spurious
-`LOCAL_DISCONNECT`. The protocol code itself is exercised on POSIX.
-If you write tests around `WsClient`, consider gating with
-`if (builtin.os.tag == .windows) return error.SkipZigTest;` for
-roundtrip-heavy cases until upstream stabilises.
+On Windows, `WsClient` uses raw Winsock sockets rather than
+`std.Io.Threaded` stream reads, and zono's own `WsClient` roundtrip
+tests use tiny raw-socket test servers for echo / non-101 cases. This
+avoids known `std.Io.Threaded` same-process WebSocket edge cases on
+Windows while keeping the client protocol paths covered there.
 
-See `src/ws_test_client.zig` for the full source — it's small (<800
-lines) and uncontroversial; copy or adapt it if your needs diverge.
+If your own tests spin up a full zono `Server` and do same-process
+WebSocket roundtrips on Windows, be aware that upstream
+`std.Io.Threaded` still has rough edges in that configuration.
+
+See `src/ws_test_client.zig` for the full source if you want to copy or
+adapt the helper.

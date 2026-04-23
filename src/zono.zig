@@ -10,6 +10,7 @@ pub const path = @import("path.zig");
 pub const serve_static = @import("serve_static.zig");
 pub const websocket = @import("websocket.zig");
 pub const request_id = @import("request_id.zig");
+pub const ws_test_client = @import("ws_test_client.zig");
 
 pub const Request = request.Request;
 pub const Param = request.Param;
@@ -48,6 +49,10 @@ pub const ServeStaticOptions = serve_static.ServeStaticOptions;
 pub const WebSocketConnection = response.WebSocketConnection;
 pub const WebSocketUpgradeOptions = websocket.WebSocketUpgradeOptions;
 pub const RequestIdOptions = request_id.RequestIdOptions;
+pub const WsClient = ws_test_client.WsClient;
+pub const WsClientMessage = ws_test_client.Message;
+pub const WsClientMessageKind = ws_test_client.MessageKind;
+pub const WsClientConnectOptions = ws_test_client.ConnectOptions;
 
 pub const CookieOptions = response.CookieOptions;
 pub const DeleteCookieOptions = response.DeleteCookieOptions;
@@ -88,6 +93,7 @@ test {
     _ = serve_static;
     _ = websocket;
     _ = request_id;
+    _ = ws_test_client;
 
     try std.testing.expect(!@hasDecl(@This(), "validator"));
     try std.testing.expect(!@hasDecl(@This(), "cors"));

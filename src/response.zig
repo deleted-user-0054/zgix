@@ -58,23 +58,23 @@ pub const WebSocketConnection = struct {
         return self.socket.readSmallMessage();
     }
 
-    pub fn writeText(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+    pub fn writeText(self: *WebSocketConnection, data: []const u8) std.Io.Writer.Error!void {
         try self.socket.writeMessage(data, .text);
     }
 
-    pub fn writeBinary(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+    pub fn writeBinary(self: *WebSocketConnection, data: []const u8) std.Io.Writer.Error!void {
         try self.socket.writeMessage(data, .binary);
     }
 
-    pub fn writePong(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+    pub fn writePong(self: *WebSocketConnection, data: []const u8) std.Io.Writer.Error!void {
         try self.socket.writeMessage(data, .pong);
     }
 
-    pub fn close(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+    pub fn close(self: *WebSocketConnection, data: []const u8) std.Io.Writer.Error!void {
         try self.socket.writeMessage(data, .connection_close);
     }
 
-    pub fn flush(self: *WebSocketConnection) std.http.Server.WebSocket.Writer.Error!void {
+    pub fn flush(self: *WebSocketConnection) std.Io.Writer.Error!void {
         try self.socket.flush();
     }
 };

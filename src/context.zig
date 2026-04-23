@@ -23,6 +23,12 @@ pub const SharedState = struct {
     not_found_handler: ?Handler = null,
     on_error_handler: ?*const fn (err: anyerror, req: Request) Response = null,
     last_error: ?anyerror = null,
+    /// Reentry guard for `App.onError`: when an error handler itself fails or
+    /// throws, we must not re-invoke the user hook (infinite recursion). The
+    /// dispatch site sets this to `true` for the duration of the user
+    /// handler call and clears it after; nested errors fall through to the
+    /// static `Internal Server Error` 500.
+    in_error_handler: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) SharedState {
         return .{ .allocator = allocator };
@@ -116,6 +122,13 @@ pub const Context = struct {
 
     pub fn get(self: *Context, comptime T: type, key: []const u8) ?T {
         return self.state.get(T, key);
+    }
+
+    /// Returns the request id stashed by the `requestId` middleware, or
+    /// `null` when the middleware was not applied to this request.
+    /// Sugar over `c.get([]const u8, "request_id")`.
+    pub fn requestId(self: *Context) ?[]const u8 {
+        return self.state.get([]const u8, "request_id");
     }
 
     pub fn body(self: *Context, content: []const u8, content_type: []const u8) Response {

@@ -954,9 +954,7 @@ fn resolveErrorHandler(target: anytype) ResolvedErrorHandler {
 
 fn resolveErrorHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedErrorHandler {
     const info = @typeInfo(FnType).@"fn";
-    if (info.return_type == null or info.return_type.? != Response) {
-        @compileError("App.onError handlers must return zono.Response.");
-    }
+    const returns_error = comptime returnsErrorResponse(info.return_type, "App.onError handlers");
     if (info.params.len != 2 or info.params[0].type == null or info.params[1].type == null) {
         @compileError("App.onError handlers must accept exactly two parameters.");
     }
@@ -967,11 +965,11 @@ fn resolveErrorHandlerFn(comptime target: anytype, comptime FnType: type) Resolv
     const ParamType = info.params[1].type.?;
     if (ParamType == *Context) {
         return .{
-            .handler = wrapContextErrorResponder(target),
+            .handler = wrapContextErrorResponder(target, returns_error),
         };
     }
 
-    @compileError("App.onError handlers must be fn(err: anyerror, c: *zono.Context) zono.Response.");
+    @compileError("App.onError handlers must be fn(err: anyerror, c: *zono.Context) zono.Response or fn(err: anyerror, c: *zono.Context) !zono.Response.");
 }
 
 fn returnsErrorResponse(comptime return_type: ?type, comptime owner: []const u8) bool {
@@ -1100,14 +1098,18 @@ fn wrapContextErrorMiddleware(comptime target: anytype) App.DispatchMiddleware {
     }.run;
 }
 
-fn wrapContextErrorResponder(comptime target: anytype) ErrorHandler {
+fn wrapContextErrorResponder(comptime target: anytype, comptime returns_error: bool) ErrorHandler {
     return struct {
         fn run(err: anyerror, req: Request) Response {
             const scope = createHandlerScope(req) orelse
                 return response_mod.internalError("context alloc failed");
             scope.ctx_scope.ctx.state.last_error = err;
             scope.ctx_scope.ctx.err = err;
-            var response = target(err, scope.ctx_scope.ctx);
+            var response = if (returns_error)
+                target(err, scope.ctx_scope.ctx) catch |hook_err|
+                    dispatchHandlerError(scope.ctx_scope.ctx.req, hook_err)
+            else
+                target(err, scope.ctx_scope.ctx);
             finalizeHandlerScope(scope, &response);
             return response;
         }
@@ -1123,7 +1125,15 @@ fn dispatchHandlerError(req: Request, err: anyerror) Response {
     if (req.context_state) |raw_state| {
         const state: *context_mod.SharedState = @ptrCast(@alignCast(raw_state));
         state.last_error = err;
+        // Reentry guard: if we're already inside the user's onError, do NOT
+        // call it again — fall through to the static 500. Otherwise we'd
+        // recurse forever when the hook itself returns/throws an error.
+        if (state.in_error_handler) {
+            return response_mod.text(.internal_server_error, "Internal Server Error");
+        }
         if (state.on_error_handler) |handler| {
+            state.in_error_handler = true;
+            defer state.in_error_handler = false;
             return handler(err, req);
         }
     }
@@ -1930,4 +1940,51 @@ test "streaming with_context can read route params after outer return" {
     defer res.deinit();
 
     try std.testing.expectEqualStrings("item=42", res.body);
+}
+
+test "app onError reentry guard prevents recursion when hook itself errors" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Hook itself returns an error. The reentry guard must catch the second
+    // dispatch and serve the static 500 instead of looping forever.
+    app.onError(struct {
+        fn run(_: anyerror, _: *Context) !Response {
+            return error.HookExploded;
+        }
+    }.run);
+    try app.get("/boom", struct {
+        fn run(_: *Context) !Response {
+            return error.OriginalBoom;
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/boom"));
+    try std.testing.expectEqual(std.http.Status.internal_server_error, res.status);
+    try std.testing.expectEqualStrings("Internal Server Error", res.body);
+}
+
+test "app onError accepts the error-returning context signature" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.onError(struct {
+        fn run(err: anyerror, c: *Context) !Response {
+            c.status(.bad_gateway);
+            return c.text(@errorName(err));
+        }
+    }.run);
+    try app.get("/err-ctx", struct {
+        fn run(_: *Context) !Response {
+            return error.GatewayDown;
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/err-ctx"));
+    try std.testing.expectEqual(std.http.Status.bad_gateway, res.status);
+    try std.testing.expectEqualStrings("GatewayDown", res.body);
 }

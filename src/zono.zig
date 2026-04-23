@@ -9,6 +9,7 @@ pub const server = @import("server.zig");
 pub const path = @import("path.zig");
 pub const serve_static = @import("serve_static.zig");
 pub const websocket = @import("websocket.zig");
+pub const request_id = @import("request_id.zig");
 
 pub const Request = request.Request;
 pub const Param = request.Param;
@@ -46,6 +47,7 @@ pub const AppRequestOptions = app.App.RequestOptions;
 pub const ServeStaticOptions = serve_static.ServeStaticOptions;
 pub const WebSocketConnection = response.WebSocketConnection;
 pub const WebSocketUpgradeOptions = websocket.WebSocketUpgradeOptions;
+pub const RequestIdOptions = request_id.RequestIdOptions;
 
 pub const CookieOptions = response.CookieOptions;
 pub const DeleteCookieOptions = response.DeleteCookieOptions;
@@ -73,6 +75,7 @@ pub const cleanPath = path.cleanPath;
 pub const serveStatic = serve_static.serveStatic;
 pub const upgradeWebSocket = websocket.upgradeWebSocket;
 pub const isWebSocketUpgrade = websocket.isWebSocketUpgrade;
+pub const requestId = request_id.requestId;
 
 test {
     _ = request;
@@ -84,6 +87,7 @@ test {
     _ = path;
     _ = serve_static;
     _ = websocket;
+    _ = request_id;
 
     try std.testing.expect(!@hasDecl(@This(), "validator"));
     try std.testing.expect(!@hasDecl(@This(), "cors"));

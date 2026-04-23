@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-04-23T00:54:06Z",
+  "timestamp": "2026-04-23T01:15:06Z",
   "runner": "ubuntu-latest",
   "benchmark": {
     "tool": "wrk",
@@ -18,31 +18,31 @@
     "example": "benchmark"
   },
   "zono": {
-    "requests_per_sec": 87168.43,
-    "avg_latency_ms": "629.40us 350.02us",
-    "ram_mb": 52.3,
+    "requests_per_sec": 89032.39,
+    "avg_latency_ms": "618.07us 347.62us",
+    "ram_mb": 53.5,
     "binary_size": "312K",
-    "binary_bytes": 316632,
+    "binary_bytes": 318632,
     "source_files": 10,
     "zig_version": "0.16.0"
   },
   "zono_context": {
-    "requests_per_sec": 86261.13,
-    "avg_latency_ms": "637.31us 352.75us"
+    "requests_per_sec": 85799.98,
+    "avg_latency_ms": "641.55us 354.18us"
   },
   "merjs": {
-    "requests_per_sec": 85713.03,
-    "avg_latency_ms": "681.08us 569.21us",
+    "requests_per_sec": 119780.51,
+    "avg_latency_ms": "506.93us 710.25us",
     "ram_mb": 3.2,
-    "binary_size": "1016K",
-    "binary_bytes": 1037784,
+    "binary_size": "1.1M",
+    "binary_bytes": 1054152,
     "source_files": 42,
     "zig_version": "0.16.0",
     "baseline_ref": "v0.2.5"
   },
   "nextjs": {
-    "requests_per_sec": 1509.72,
-    "avg_latency_ms": "88.08ms 164.85ms",
+    "requests_per_sec": 1481.82,
+    "avg_latency_ms": "87.87ms 161.76ms",
     "ram_mb": 9.6,
     "node_modules_size": "613M",
     "node_modules_bytes": 575289339,

@@ -3,6 +3,7 @@ const Io = std.Io;
 const App = @import("app.zig").App;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const response_mod = @import("response.zig");
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
@@ -94,11 +95,17 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 
         var response = app.handle(req);
         defer response.deinit();
-        sendResponse(&raw_req, &response) catch break;
+        const outcome = sendResponse(&raw_req, &response, options) catch break;
+        if (outcome == .upgraded) break;
     }
 }
 
-fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response) !void {
+const SendOutcome = enum {
+    keep_alive,
+    upgraded,
+};
+
+fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response, options: Options) !SendOutcome {
     var extra_headers: [3]std.http.Header = undefined;
     var header_count: usize = 0;
 
@@ -115,31 +122,72 @@ fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response) !v
         header_count += 1;
     }
 
-    if (header_count == 0 and response.extraHeaders().len == 0) {
-        try raw_req.respond(response.body, .{
-            .status = response.status,
-        });
-        return;
-    }
-
-    if (response.extraHeaders().len == 0) {
-        try raw_req.respond(response.body, .{
-            .status = response.status,
-            .extra_headers = extra_headers[0..header_count],
-        });
-        return;
-    }
-
     const response_headers = response.extraHeaders();
-    const combined_headers = try std.heap.smp_allocator.alloc(std.http.Header, header_count + response_headers.len);
-    defer std.heap.smp_allocator.free(combined_headers);
-    @memcpy(combined_headers[0..header_count], extra_headers[0..header_count]);
-    @memcpy(combined_headers[header_count .. header_count + response_headers.len], response_headers);
+    const combined_headers = if (header_count == 0 and response_headers.len == 0)
+        &.{}
+    else blk: {
+        const headers = try std.heap.smp_allocator.alloc(std.http.Header, header_count + response_headers.len);
+        errdefer std.heap.smp_allocator.free(headers);
+        @memcpy(headers[0..header_count], extra_headers[0..header_count]);
+        @memcpy(headers[header_count .. header_count + response_headers.len], response_headers);
+        break :blk headers;
+    };
+    defer if (combined_headers.len > 0) std.heap.smp_allocator.free(combined_headers);
 
-    try raw_req.respond(response.body, .{
-        .status = response.status,
-        .extra_headers = combined_headers,
-    });
+    switch (response.runtime) {
+        .none => {
+            try raw_req.respond(response.body, .{
+                .status = response.status,
+                .extra_headers = combined_headers,
+            });
+            return .keep_alive;
+        },
+        .stream => |runtime| {
+            const stream_buffer = try std.heap.smp_allocator.alloc(u8, options.write_buffer_size);
+            defer std.heap.smp_allocator.free(stream_buffer);
+
+            var body_writer = try raw_req.respondStreaming(stream_buffer, .{
+                .content_length = runtime.content_length,
+                .respond_options = .{
+                    .status = response.status,
+                    .extra_headers = combined_headers,
+                },
+            });
+            var stream_writer: response_mod.StreamWriter = .{
+                .body_writer = &body_writer,
+            };
+            try runtime.run_fn(runtime.ctx, &stream_writer);
+            try body_writer.end();
+            return .keep_alive;
+        },
+        .websocket => |runtime| {
+            const requested = raw_req.upgradeRequested();
+            const key = switch (requested) {
+                .websocket => |maybe_key| maybe_key orelse return error.InvalidWebSocketUpgrade,
+                else => return error.InvalidWebSocketUpgrade,
+            };
+
+            var websocket_headers: [1]std.http.Header = undefined;
+            const extra_ws_headers = if (runtime.protocol) |protocol| blk: {
+                websocket_headers[0] = .{
+                    .name = "sec-websocket-protocol",
+                    .value = protocol,
+                };
+                break :blk websocket_headers[0..1];
+            } else &.{};
+
+            var socket = try raw_req.respondWebSocket(.{
+                .key = key,
+                .extra_headers = extra_ws_headers,
+            });
+            var websocket: response_mod.WebSocketConnection = .{
+                .socket = &socket,
+            };
+            try runtime.run_fn(runtime.ctx, &websocket);
+            try socket.flush();
+            return .upgraded;
+        },
+    }
 }
 
 fn collectHeaders(

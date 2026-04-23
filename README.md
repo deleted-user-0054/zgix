@@ -18,9 +18,9 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Thin platform context hooks through `req.raw`, `c.env`, `c.executionCtx`, and `c.event`
 - Web-style request body helpers through `req.arrayBuffer()`, `req.blob()`, and `req.formData()`
 - Context rendering and validated-data hooks through `c.setRenderer()`, `c.render()`, `c.setValid()`, `req.valid()`, and `zono.validator(...)`
-- Built-in helpers for `zono.serveStatic()`, `zono.cors()`, `zono.logger()`, `c.sse()`, `c.acceptWebSocket()`, and target-specific validator sugar such as `zono.validatorQuery(...)`
+- Built-in helpers for `zono.serveStatic()`, `zono.cors()`, `zono.logger()`, `zono.secureHeaders()`, `zono.bodyLimit()`, `zono.etag()`, `zono.compress()`, `zono.requestId()`, `zono.basicAuth()`, `c.stream()`, `c.streamSSE()`, `c.sse()`, `c.upgradeWebSocket()`, and target-specific validator sugar such as `zono.validatorQuery(...)`
 - Lightweight `HTTPException` handling through `c.throw()` / `req.throw()`
-- `app.request()` and `app.fetchRaw()` for lightweight route testing and raw adapter entry points without the server runtime
+- `app.request()`, `app.fetchRaw()`, `app.fetchRawResponse()`, and response adapters such as `zono.toRawResponse()` for lightweight route testing and raw adapter entry points without the server runtime
 
 ## Quick Start
 
@@ -164,6 +164,46 @@ pub fn main() !void {
         .allow_credentials = true,
     }));
     try app.use(zono.logger(.{}));
+    try app.use(zono.secureHeaders(.{}));
+    try app.use(zono.bodyLimit(1024 * 1024));
+    try app.use(zono.etag(.{}));
+    try app.use(zono.compress(.{
+        .min_bytes = 128,
+    }));
+    try app.use(zono.requestId(.{
+        .prefix = "req_",
+    }));
+    try app.use(zono.basicAuth(.{
+        .username = "admin",
+        .password = "secret",
+    }));
+}
+```
+
+### Route Listing
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.useAt("/api", struct {
+        fn run(req: zono.Request, next: zono.App.Next) zono.Response {
+            return next.run(req);
+        }
+    }.run);
+    try app.get("/posts/:id", struct {
+        fn run(_: zono.Request) zono.Response {
+            return zono.text(.ok, "post");
+        }
+    }.run);
+
+    const listing = try app.showRoutes(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(listing);
+    std.debug.print("{s}", .{listing});
 }
 ```
 
@@ -297,6 +337,9 @@ pub fn main() !void {
     try app.get("/assets/*path", zono.serveStatic(.{
         .root = "public",
         .cache_control = "public, max-age=3600",
+        .etag = true,
+        .last_modified = true,
+        .prefer_precompressed_gzip = true,
     }));
 }
 ```
@@ -425,6 +468,54 @@ pub fn main() !void {
 }
 ```
 
+### Streaming Runtime
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/stream", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.stream(struct {
+                fn write(writer: *zono.StreamWriter) !void {
+                    try writer.writeAll("hello ");
+                    try writer.writeAll("stream");
+                }
+            }.write, .{
+                .content_type = "text/plain; charset=utf-8",
+            });
+        }
+    }.run);
+
+    try app.get("/events-live", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.streamSSE(struct {
+                fn write(writer: *zono.StreamWriter) !void {
+                    try writer.writeAll("event: ready\n");
+                    try writer.writeAll("data: hello\n\n");
+                }
+            }.write);
+        }
+    }.run);
+
+    try app.get("/ws-runtime", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.upgradeWebSocket(struct {
+                fn handle(socket: *zono.WebSocketConnection) !void {
+                    try socket.writeText("connected");
+                    try socket.flush();
+                    try socket.close("");
+                }
+            }.handle, .{});
+        }
+    }.run);
+}
+```
+
 ### Raw Fetch Adapter
 
 ```zig
@@ -447,6 +538,47 @@ pub fn main() !void {
         .target = "https://example.com/hello?mode=edge",
     }, .{});
     defer res.deinit();
+
+    var raw_res = try app.fetchRawResponse(std.heap.page_allocator, .{
+        .target = "https://example.com/hello?mode=edge",
+    }, .{});
+    defer raw_res.deinit();
+}
+```
+
+### Validator With Custom Errors
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+const Query = struct {
+    page: u32,
+};
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.use(zono.validatorQueryWithOptions(struct {
+        fn run(req: zono.Request) !Query {
+            var query = try req.query(.all);
+            defer query.deinit();
+
+            const raw_page = query.value("page") orelse return error.MissingPage;
+            return .{
+                .page = try std.fmt.parseInt(u32, raw_page, 10),
+            };
+        }
+    }.run, .{
+        .on_error = struct {
+            fn run(err: anyerror, c: *zono.Context) zono.Response {
+                return c.jsonWithStatus(.bad_request, .{
+                    .error = @errorName(err),
+                });
+            }
+        }.run,
+    }));
 }
 ```
 

@@ -287,11 +287,33 @@ pub const Context = struct {
         return self.takeResponse();
     }
 
+    pub fn stream(self: *Context, comptime handler: anytype, stream_options: @import("response.zig").StreamOptions) Response {
+        const response = realtime_mod.stream(self.req, handler, stream_options);
+        self.mergeResponse(response);
+        return self.takeResponse();
+    }
+
+    pub fn streamSSE(self: *Context, comptime handler: anytype) Response {
+        const response = realtime_mod.streamSSE(self.req, handler);
+        self.mergeResponse(response);
+        return self.takeResponse();
+    }
+
     pub fn acceptWebSocket(
         self: *Context,
         websocket_options: realtime_mod.WebSocketAcceptOptions,
     ) realtime_mod.WebSocketUpgradeError!Response {
         const response = try realtime_mod.acceptWebSocket(self.req, websocket_options);
+        self.mergeResponse(response);
+        return self.takeResponse();
+    }
+
+    pub fn upgradeWebSocket(
+        self: *Context,
+        comptime handler: anytype,
+        websocket_options: realtime_mod.UpgradeWebSocketOptions,
+    ) Response {
+        const response = realtime_mod.upgradeWebSocket(self.req, handler, websocket_options);
         self.mergeResponse(response);
         return self.takeResponse();
     }

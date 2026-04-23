@@ -15,9 +15,93 @@ pub const WebSocketAcceptOptions = struct {
     protocol: ?[]const u8 = null,
 };
 
+pub const UpgradeWebSocketOptions = response_mod.WebSocketUpgradeOptions;
+pub const StreamOptions = response_mod.StreamOptions;
+
 pub const WebSocketUpgradeError = error{
     InvalidWebSocketUpgrade,
 };
+
+pub fn stream(req: Request, comptime handler: anytype, stream_options: StreamOptions) Response {
+    const Builder = struct {
+        const Data = struct {
+            req: Request,
+        };
+
+        fn deinit(allocator: std.mem.Allocator, ctx: *const anyopaque) void {
+            const data: *const Data = @ptrCast(@alignCast(ctx));
+            allocator.destroy(@constCast(data));
+        }
+
+        fn run(ctx: *const anyopaque, writer: *response_mod.StreamWriter) anyerror!void {
+            const data: *const Data = @ptrCast(@alignCast(ctx));
+            const mode = comptime streamHandlerMode(@TypeOf(handler));
+            if (comptime mode == .request) {
+                try handler(data.req, writer);
+            } else {
+                try handler(writer);
+            }
+        }
+    };
+
+    const data = req.allocator.create(Builder.Data) catch return response_mod.internalError("stream alloc failed");
+    data.* = .{ .req = req };
+    var response = response_mod.streamRuntime(stream_options, .{
+        .ctx = data,
+        .run_fn = Builder.run,
+        .content_length = stream_options.content_length,
+        .deinit_fn = Builder.deinit,
+    });
+    response.runtime_allocator = req.allocator;
+    return response;
+}
+
+pub fn streamSSE(req: Request, comptime handler: anytype) Response {
+    var res = stream(req, handler, .{
+        .content_type = "text/event-stream; charset=utf-8",
+    });
+    _ = res.header("cache-control", "no-cache");
+    _ = res.header("connection", "keep-alive");
+    return res;
+}
+
+pub fn upgradeWebSocket(req: Request, comptime handler: anytype, websocket_options: UpgradeWebSocketOptions) Response {
+    const Builder = struct {
+        const Data = struct {
+            req: Request,
+            protocol: ?[]const u8,
+        };
+
+        fn deinit(allocator: std.mem.Allocator, ctx: *const anyopaque) void {
+            const data: *const Data = @ptrCast(@alignCast(ctx));
+            allocator.destroy(@constCast(data));
+        }
+
+        fn run(ctx: *const anyopaque, socket: *response_mod.WebSocketConnection) anyerror!void {
+            const data: *const Data = @ptrCast(@alignCast(ctx));
+            const mode = comptime webSocketHandlerMode(@TypeOf(handler));
+            if (comptime mode == .request) {
+                try handler(data.req, socket);
+            } else {
+                try handler(socket);
+            }
+        }
+    };
+
+    const data = req.allocator.create(Builder.Data) catch return response_mod.internalError("websocket alloc failed");
+    data.* = .{
+        .req = req,
+        .protocol = websocket_options.protocol,
+    };
+    var response = response_mod.websocketRuntime(.{
+        .ctx = data,
+        .run_fn = Builder.run,
+        .protocol = websocket_options.protocol,
+        .deinit_fn = Builder.deinit,
+    });
+    response.runtime_allocator = req.allocator;
+    return response;
+}
 
 pub fn sse(allocator: std.mem.Allocator, events: anytype) !Response {
     const payload = try formatSSE(allocator, events);
@@ -182,6 +266,69 @@ fn eqIgnoreCase(left: []const u8, right: []const u8) bool {
     return std.ascii.eqlIgnoreCase(left, right);
 }
 
+const StreamHandlerMode = enum {
+    request,
+    writer,
+};
+
+fn streamHandlerMode(comptime HandlerType: type) StreamHandlerMode {
+    const info = functionInfo(HandlerType);
+    if (info.params.len != 1 and info.params.len != 2) {
+        @compileError("zono.stream handlers must be fn(*zono.StreamWriter) !void or fn(zono.Request, *zono.StreamWriter) !void.");
+    }
+    if (info.params.len == 1) {
+        const Param = info.params[0].type orelse @compileError("zono.stream handlers require concrete parameter types.");
+        if (Param != *response_mod.StreamWriter) {
+            @compileError("zono.stream handlers must accept *zono.StreamWriter.");
+        }
+        return .writer;
+    }
+
+    const First = info.params[0].type orelse @compileError("zono.stream handlers require concrete parameter types.");
+    const Second = info.params[1].type orelse @compileError("zono.stream handlers require concrete parameter types.");
+    if (First != Request or Second != *response_mod.StreamWriter) {
+        @compileError("zono.stream handlers must be fn(*zono.StreamWriter) !void or fn(zono.Request, *zono.StreamWriter) !void.");
+    }
+    return .request;
+}
+
+const WebSocketHandlerMode = enum {
+    request,
+    socket,
+};
+
+fn webSocketHandlerMode(comptime HandlerType: type) WebSocketHandlerMode {
+    const info = functionInfo(HandlerType);
+    if (info.params.len != 1 and info.params.len != 2) {
+        @compileError("zono.upgradeWebSocket handlers must be fn(*zono.WebSocketConnection) !void or fn(zono.Request, *zono.WebSocketConnection) !void.");
+    }
+    if (info.params.len == 1) {
+        const Param = info.params[0].type orelse @compileError("zono.upgradeWebSocket handlers require concrete parameter types.");
+        if (Param != *response_mod.WebSocketConnection) {
+            @compileError("zono.upgradeWebSocket handlers must accept *zono.WebSocketConnection.");
+        }
+        return .socket;
+    }
+
+    const First = info.params[0].type orelse @compileError("zono.upgradeWebSocket handlers require concrete parameter types.");
+    const Second = info.params[1].type orelse @compileError("zono.upgradeWebSocket handlers require concrete parameter types.");
+    if (First != Request or Second != *response_mod.WebSocketConnection) {
+        @compileError("zono.upgradeWebSocket handlers must be fn(*zono.WebSocketConnection) !void or fn(zono.Request, *zono.WebSocketConnection) !void.");
+    }
+    return .request;
+}
+
+fn functionInfo(comptime T: type) std.builtin.Type.Fn {
+    return switch (@typeInfo(T)) {
+        .@"fn" => |info| info,
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"fn" => |info| info,
+            else => @compileError("zono realtime handlers must be functions or function pointers."),
+        },
+        else => @compileError("zono realtime handlers must be functions or function pointers."),
+    };
+}
+
 test "sse helper formats event streams" {
     var res = try sse(std.testing.allocator, &[_]SSEEvent{
         .{
@@ -195,6 +342,32 @@ test "sse helper formats event streams" {
     try std.testing.expectEqual(std.http.Status.ok, res.status);
     try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", res.content_type);
     try std.testing.expectEqualStrings("event: message\nid: 1\ndata: hello\ndata: world\n\n", res.body);
+}
+
+test "stream runtime helper marks responses as streaming" {
+    const req = Request.init(std.testing.allocator, .GET, "/stream");
+    var res = stream(req, struct {
+        fn run(_: *response_mod.StreamWriter) !void {}
+    }.run, .{
+        .content_type = "text/plain; charset=utf-8",
+    });
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", res.content_type);
+    try std.testing.expect(res.runtime == .stream);
+}
+
+test "upgradeWebSocket runtime helper marks responses as websocket upgrades" {
+    const req = Request.init(std.testing.allocator, .GET, "/ws");
+    var res = upgradeWebSocket(req, struct {
+        fn run(_: *response_mod.WebSocketConnection) !void {}
+    }.run, .{
+        .protocol = "chat",
+    });
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.switching_protocols, res.status);
+    try std.testing.expect(res.runtime == .websocket);
 }
 
 test "websocket helper validates and accepts upgrade requests" {

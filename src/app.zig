@@ -5,6 +5,7 @@ const MatchedRoute = request_mod.MatchedRoute;
 const MatchedRouteKind = request_mod.MatchedRouteKind;
 const Response = @import("response.zig").Response;
 const response_mod = @import("response.zig");
+const adapter_mod = @import("adapter.zig");
 const http_exception_mod = @import("http_exception.zig");
 const validator_mod = @import("validator.zig");
 const route_helper_mod = @import("route_helper.zig");
@@ -485,6 +486,12 @@ pub const App = struct {
         });
     }
 
+    pub fn fetchRawResponse(self: *App, allocator: std.mem.Allocator, raw_request: RawRequest, fetch_options: FetchRawOptions) !adapter_mod.RawResponse {
+        var response = try self.fetchRaw(allocator, raw_request, fetch_options);
+        defer response.deinit();
+        return try adapter_mod.fromResponse(allocator, response);
+    }
+
     pub fn request(self: *App, allocator: std.mem.Allocator, input: anytype, req_options: RequestOptions) !Response {
         const InputType = @TypeOf(input);
         if (InputType == Request) {
@@ -499,6 +506,27 @@ pub const App = struct {
 
         const target: []const u8 = input;
         return try self.requestTarget(allocator, target, req_options);
+    }
+
+    pub fn showRoutes(self: *const App, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+
+        for (self.middlewares.items) |middleware_entry| {
+            try out.writer.print("USE {s}\n", .{middleware_entry.prefix});
+        }
+        for (self.mounts.items) |mount_entry| {
+            const target_kind = switch (mount_entry.target) {
+                .app => "app",
+                .handler => "handler",
+            };
+            try out.writer.print("MOUNT {s} [{s}]\n", .{ mount_entry.prefix, target_kind });
+        }
+        for (self.routes.items) |registered_route| {
+            try out.writer.print("{s} {s}\n", .{ @tagName(registered_route.method), registered_route.path });
+        }
+
+        return try out.toOwnedSlice();
     }
 
     fn requestTarget(self: *App, allocator: std.mem.Allocator, target: []const u8, req_options: RequestOptions) !Response {
@@ -520,12 +548,18 @@ pub const App = struct {
 
         var response = self.handle(req);
         defer response.deinit();
+        if (response.runtime != .none) {
+            return try response_mod.internalError("runtime responses are not supported by app.request").clone(allocator);
+        }
         return try response.clone(allocator);
     }
 
     fn cloneHandledResponse(self: *App, allocator: std.mem.Allocator, req: Request) !Response {
         var response = self.handle(req);
         defer response.deinit();
+        if (response.runtime != .none) {
+            return try response_mod.internalError("runtime responses are not supported by app.request").clone(allocator);
+        }
         return try response.clone(allocator);
     }
 
@@ -993,7 +1027,8 @@ fn resolveMiddlewareHandler(target: anytype) ResolvedMiddleware {
     }
 
     if (comptime isValidatorMarker(TargetType)) {
-        const wrapped = comptime validator_mod.wrapValidator(TargetType.validator_target, TargetType.validator_parser);
+        const validator_options = comptime if (@hasDecl(TargetType, "validator_options")) TargetType.validator_options else validator_mod.ValidatorOptions{};
+        const wrapped = comptime validator_mod.wrapValidator(TargetType.validator_target, TargetType.validator_parser, validator_options);
         return resolveMiddlewareFn(wrapped, @typeInfo(@TypeOf(wrapped)).pointer.child);
     }
 
@@ -1260,7 +1295,7 @@ fn responseFromHttpException(allocator: std.mem.Allocator, exception: http_excep
         _ = borrowed.appendHeader(header.name, header.value);
     }
     defer borrowed.deinit();
-    return try borrowed.clone(allocator);
+    return borrowed.clone(allocator) catch unreachable;
 }
 
 fn wrapRouteOnError(comptime route_error_handler: ErrorHandler, comptime inner_handler: Handler) Handler {
@@ -2608,6 +2643,34 @@ test "app fetchRaw adapts target raw env executionCtx and event" {
     defer res.deinit();
 
     try std.testing.expectEqualStrings("{\"mode\":\"edge\",\"env\":\"edge\",\"event\":88,\"raw\":9,\"ready\":true}", res.body);
+}
+
+test "app showRoutes lists middleware mounts and routes" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.useAt("/api", struct {
+        fn run(req: Request, next: App.Next) Response {
+            return next.run(req);
+        }
+    }.run);
+    try app.mount("/legacy", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "legacy");
+        }
+    }.run);
+    try app.get("/posts/:id", struct {
+        fn run(_: Request) Response {
+            return response_mod.text(.ok, "post");
+        }
+    }.run);
+
+    const rendered = try app.showRoutes(std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "USE /api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "MOUNT /legacy [handler]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "GET /posts/:id") != null);
 }
 
 test "app fetch aliases handle" {

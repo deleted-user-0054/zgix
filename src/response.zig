@@ -48,6 +48,87 @@ pub const CookieError = std.mem.Allocator.Error || error{
     HostPrefixDisallowsDomain,
 };
 
+pub const StreamOptions = struct {
+    status: std.http.Status = .ok,
+    content_type: []const u8 = "application/octet-stream",
+    content_length: ?u64 = null,
+};
+
+pub const StreamWriter = struct {
+    body_writer: *std.http.BodyWriter,
+
+    pub fn writeAll(self: *StreamWriter, bytes: []const u8) std.http.BodyWriter.Error!void {
+        try self.body_writer.writer.writeAll(bytes);
+    }
+
+    pub fn print(self: *StreamWriter, comptime fmt: []const u8, args: anytype) std.http.BodyWriter.Error!void {
+        try self.body_writer.writer.print(fmt, args);
+    }
+
+    pub fn flush(self: *StreamWriter) std.http.BodyWriter.Error!void {
+        try self.body_writer.flush();
+    }
+};
+
+pub const StreamRunFn = *const fn (ctx: *const anyopaque, writer: *StreamWriter) anyerror!void;
+
+pub const StreamRuntime = struct {
+    ctx: *const anyopaque,
+    run_fn: StreamRunFn,
+    content_length: ?u64 = null,
+    deinit_fn: ?*const fn (allocator: std.mem.Allocator, ctx: *const anyopaque) void = null,
+};
+
+pub const WebSocketConnection = struct {
+    socket: *std.http.Server.WebSocket,
+
+    pub const SmallMessage = std.http.Server.WebSocket.SmallMessage;
+    pub const ReadSmallMessageError = std.http.Server.WebSocket.ReadSmallTextMessageError;
+
+    pub fn readSmallMessage(self: *WebSocketConnection) ReadSmallMessageError!SmallMessage {
+        return self.socket.readSmallMessage();
+    }
+
+    pub fn writeText(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+        try self.socket.writeMessage(data, .text);
+    }
+
+    pub fn writeBinary(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+        try self.socket.writeMessage(data, .binary);
+    }
+
+    pub fn writePong(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+        try self.socket.writeMessage(data, .pong);
+    }
+
+    pub fn close(self: *WebSocketConnection, data: []const u8) std.http.Server.WebSocket.Writer.Error!void {
+        try self.socket.writeMessage(data, .connection_close);
+    }
+
+    pub fn flush(self: *WebSocketConnection) std.http.Server.WebSocket.Writer.Error!void {
+        try self.socket.flush();
+    }
+};
+
+pub const WebSocketUpgradeOptions = struct {
+    protocol: ?[]const u8 = null,
+};
+
+pub const WebSocketRunFn = *const fn (ctx: *const anyopaque, socket: *WebSocketConnection) anyerror!void;
+
+pub const WebSocketRuntime = struct {
+    ctx: *const anyopaque,
+    run_fn: WebSocketRunFn,
+    protocol: ?[]const u8 = null,
+    deinit_fn: ?*const fn (allocator: std.mem.Allocator, ctx: *const anyopaque) void = null,
+};
+
+pub const Runtime = union(enum) {
+    none,
+    stream: StreamRuntime,
+    websocket: WebSocketRuntime,
+};
+
 pub const Response = struct {
     status: std.http.Status,
     content_type: []const u8,
@@ -57,6 +138,8 @@ pub const Response = struct {
     extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty,
     extra_headers_allocator: ?std.mem.Allocator = null,
     owned_allocator: ?std.mem.Allocator = null,
+    runtime: Runtime = .none,
+    runtime_allocator: ?std.mem.Allocator = null,
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
@@ -225,6 +308,8 @@ pub const Response = struct {
     }
 
     pub fn clone(self: Response, allocator: std.mem.Allocator) !Response {
+        if (self.runtime != .none) return error.UnsupportedRuntimeClone;
+
         var cloned: Response = .{
             .status = self.status,
             .content_type = try allocator.dupe(u8, self.content_type),
@@ -247,6 +332,12 @@ pub const Response = struct {
     }
 
     pub fn deinit(self: *Response) void {
+        if (self.runtime_allocator) |allocator| switch (self.runtime) {
+            .stream => |runtime| if (runtime.deinit_fn) |deinit_fn| deinit_fn(allocator, runtime.ctx),
+            .websocket => |runtime| if (runtime.deinit_fn) |deinit_fn| deinit_fn(allocator, runtime.ctx),
+            .none => {},
+        };
+
         if (self.owned_allocator) |allocator| {
             allocator.free(self.content_type);
             allocator.free(self.body);
@@ -264,9 +355,11 @@ pub const Response = struct {
         self.extra_headers = .empty;
         self.extra_headers_allocator = null;
         self.owned_allocator = null;
+        self.runtime = .none;
+        self.runtime_allocator = null;
     }
 
-    fn ensureOwned(self: *Response, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+    pub fn ensureOwned(self: *Response, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
         if (self.owned_allocator != null) return;
 
         const owned_content_type = try allocator.dupe(u8, self.content_type);
@@ -448,6 +541,24 @@ pub fn body(status: std.http.Status, content_type: []const u8, content: []const 
         .status = status,
         .content_type = content_type,
         .body = content,
+    };
+}
+
+pub fn streamRuntime(stream_options: StreamOptions, runtime: StreamRuntime) Response {
+    return .{
+        .status = stream_options.status,
+        .content_type = stream_options.content_type,
+        .body = "",
+        .runtime = .{ .stream = runtime },
+    };
+}
+
+pub fn websocketRuntime(runtime: WebSocketRuntime) Response {
+    return .{
+        .status = .switching_protocols,
+        .content_type = "",
+        .body = "",
+        .runtime = .{ .websocket = runtime },
     };
 }
 

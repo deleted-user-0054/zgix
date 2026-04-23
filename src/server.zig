@@ -87,7 +87,6 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 
         var req = Request.init(alloc, raw_req.head.method, path);
         req.query_string = query_string;
-        req.raw = @ptrCast(&raw_req);
         req.header_lookup_ctx = @ptrCast(&raw_req);
         req.header_lookup_fn = lookupHeader;
         req.headers_collect_fn = collectHeaders;
@@ -95,7 +94,7 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 
         var response = app.handle(req);
         defer response.deinit();
-        const outcome = sendResponse(&raw_req, &response, options) catch break;
+        const outcome = sendResponse(&raw_req, &response) catch break;
         if (outcome == .upgraded) break;
     }
 }
@@ -105,7 +104,7 @@ const SendOutcome = enum {
     upgraded,
 };
 
-fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response, options: Options) !SendOutcome {
+fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response) !SendOutcome {
     var extra_headers: [3]std.http.Header = undefined;
     var header_count: usize = 0;
 
@@ -140,24 +139,6 @@ fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response, op
                 .status = response.status,
                 .extra_headers = combined_headers,
             });
-            return .keep_alive;
-        },
-        .stream => |runtime| {
-            const stream_buffer = try std.heap.smp_allocator.alloc(u8, options.write_buffer_size);
-            defer std.heap.smp_allocator.free(stream_buffer);
-
-            var body_writer = try raw_req.respondStreaming(stream_buffer, .{
-                .content_length = runtime.content_length,
-                .respond_options = .{
-                    .status = response.status,
-                    .extra_headers = combined_headers,
-                },
-            });
-            var stream_writer: response_mod.StreamWriter = .{
-                .body_writer = &body_writer,
-            };
-            try runtime.run_fn(runtime.ctx, &stream_writer);
-            try body_writer.end();
             return .keep_alive;
         },
         .websocket => |runtime| {

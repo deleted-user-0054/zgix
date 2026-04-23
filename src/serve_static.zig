@@ -1,5 +1,5 @@
 const std = @import("std");
-const Request = @import("request.zig").Request;
+const Context = @import("context.zig").Context;
 const Response = @import("response.zig").Response;
 const response_mod = @import("response.zig");
 const path_mod = @import("path.zig");
@@ -7,144 +7,68 @@ const path_mod = @import("path.zig");
 pub const ServeStaticOptions = struct {
     root: []const u8,
     path: ?[]const u8 = null,
-    wildcard_param: ?[]const u8 = null,
     index: ?[]const u8 = "index.html",
     cache_control: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
-    etag: bool = true,
-    last_modified: bool = true,
-    prefer_precompressed_gzip: bool = true,
     max_bytes: usize = 16 * 1024 * 1024,
 };
 
-pub fn serveStatic(comptime static_options: ServeStaticOptions) *const fn (Request) Response {
+pub fn serveStatic(comptime static_options: ServeStaticOptions) fn (*Context, Context.Next) Response {
     return struct {
-        fn run(req: Request) Response {
-            const relative_path = resolveRelativePath(req, static_options) catch |err| switch (err) {
-                error.InvalidStaticPath => return response_mod.notFound(),
-                else => return response_mod.internalError("static path resolve failed"),
-            };
-            defer req.allocator.free(relative_path);
+        fn run(c: *Context, next: Context.Next) Response {
+            if (c.req.method != .GET and c.req.method != .HEAD) {
+                next.run();
+                return c.takeResponse();
+            }
 
-            const full_path = std.fs.path.join(req.allocator, &.{ static_options.root, relative_path }) catch {
+            const relative_path = resolveRelativePath(c.req.allocator, c.req.path, static_options) catch {
+                next.run();
+                return c.takeResponse();
+            };
+            defer c.req.allocator.free(relative_path);
+
+            const full_path = std.fs.path.join(c.req.allocator, &.{ static_options.root, relative_path }) catch {
                 return response_mod.internalError("static path join failed");
             };
-            defer req.allocator.free(full_path);
+            defer c.req.allocator.free(full_path);
 
             var io_impl = std.Io.Threaded.init_single_threaded;
             const io = io_impl.io();
-            const selected = selectStaticAsset(req, req.allocator, io, full_path, relative_path, static_options) catch |err| switch (err) {
-                error.FileNotFound, error.IsDir, error.NotDir => return response_mod.notFound(),
+            const file = std.Io.Dir.cwd().readFileAlloc(io, full_path, c.req.allocator, .limited(static_options.max_bytes)) catch |err| switch (err) {
+                error.FileNotFound, error.IsDir, error.NotDir => {
+                    next.run();
+                    return c.takeResponse();
+                },
                 else => return response_mod.internalError("static file read failed"),
             };
-            defer if (selected.path.ptr != full_path.ptr) req.allocator.free(selected.path);
+            defer c.req.allocator.free(file);
 
-            if (static_options.last_modified) {
-                const formatted = formatHttpDate(req.allocator, selected.stat.mtime) catch null;
-                if (formatted) |last_modified| {
-                    defer req.allocator.free(last_modified);
-                    if (req.header("if-modified-since")) |if_modified_since| {
-                        if (std.mem.eql(u8, std.mem.trim(u8, if_modified_since, " \t"), last_modified)) {
-                            var not_modified = response_mod.body(.not_modified, "", "").clone(req.allocator) catch {
-                                return response_mod.internalError("static response alloc failed");
-                            };
-                            _ = not_modified.header("last-modified", last_modified);
-                            if (static_options.etag) {
-                                const tag = formatStatETag(req.allocator, selected.stat) catch null;
-                                if (tag) |etag| {
-                                    _ = not_modified.header("etag", etag);
-                                    req.allocator.free(etag);
-                                }
-                            }
-                            return not_modified;
-                        }
-                    }
-                }
-            }
-
-            if (static_options.etag) {
-                const tag = formatStatETag(req.allocator, selected.stat) catch null;
-                if (tag) |etag| {
-                    if (req.header("if-none-match")) |if_none_match| {
-                        if (std.mem.eql(u8, std.mem.trim(u8, if_none_match, " \t"), etag)) {
-                            var not_modified = response_mod.body(.not_modified, "", "").clone(req.allocator) catch {
-                                return response_mod.internalError("static response alloc failed");
-                            };
-                            _ = not_modified.header("etag", etag);
-                            req.allocator.free(etag);
-                            if (static_options.last_modified) {
-                                if (formatHttpDate(req.allocator, selected.stat.mtime) catch null) |last_modified| {
-                                    _ = not_modified.header("last-modified", last_modified);
-                                    req.allocator.free(last_modified);
-                                }
-                            }
-                            return not_modified;
-                        }
-                    }
-                    req.allocator.free(etag);
-                }
-            }
-
-            const file = std.Io.Dir.cwd().readFileAlloc(io, selected.path, req.allocator, .limited(static_options.max_bytes)) catch |err| switch (err) {
-                error.FileNotFound, error.IsDir, error.NotDir => return response_mod.notFound(),
-                else => return response_mod.internalError("static file read failed"),
-            };
-
-            var res = response_mod.body(.ok, static_options.content_type orelse contentTypeForPath(relative_path), file).clone(req.allocator) catch {
-                req.allocator.free(file);
+            const body_content = if (c.req.method == .HEAD) "" else file;
+            var res = response_mod.body(.ok, static_options.content_type orelse contentTypeForPath(relative_path), body_content).clone(c.req.allocator) catch {
                 return response_mod.internalError("static response alloc failed");
             };
-            req.allocator.free(file);
             if (static_options.cache_control) |cache_control| {
                 _ = res.header("cache-control", cache_control);
-            }
-            if (selected.gzip_encoded) {
-                _ = res.header("content-encoding", "gzip");
-                _ = res.header("vary", "accept-encoding");
-            }
-            if (static_options.etag) {
-                if (formatStatETag(req.allocator, selected.stat) catch null) |etag| {
-                    _ = res.header("etag", etag);
-                    req.allocator.free(etag);
-                }
-            }
-            if (static_options.last_modified) {
-                if (formatHttpDate(req.allocator, selected.stat.mtime) catch null) |last_modified| {
-                    _ = res.header("last-modified", last_modified);
-                    req.allocator.free(last_modified);
-                }
             }
             return res;
         }
     }.run;
 }
 
-const SelectedAsset = struct {
-    path: []const u8,
-    stat: std.Io.File.Stat,
-    gzip_encoded: bool = false,
-};
-
-fn resolveRelativePath(req: Request, static_options: ServeStaticOptions) ![]u8 {
-    if (static_options.path) |fixed_path| {
-        return try sanitizeRelativePath(req.allocator, fixed_path, static_options.index);
-    }
-
-    const source = if (static_options.wildcard_param) |param_name|
-        req.param(param_name) orelse req.path
-    else if (req.paramsSlice().len > 0)
-        req.paramsSlice()[req.paramsSlice().len - 1].value
-    else
-        req.path;
-
-    return try sanitizeRelativePath(req.allocator, source, static_options.index);
+fn resolveRelativePath(
+    allocator: std.mem.Allocator,
+    request_path: []const u8,
+    static_options: ServeStaticOptions,
+) error{ OutOfMemory, InvalidStaticPath }![]const u8 {
+    const source = static_options.path orelse request_path;
+    return try sanitizeRelativePath(allocator, source, static_options.index);
 }
 
 fn sanitizeRelativePath(
     allocator: std.mem.Allocator,
     input_path: []const u8,
     index_path: ?[]const u8,
-) error{ OutOfMemory, InvalidStaticPath }![]u8 {
+) error{ OutOfMemory, InvalidStaticPath }![]const u8 {
     const trimmed = std.mem.trim(u8, input_path, " \t");
     var raw_iter = std.mem.splitScalar(u8, trimmed, '/');
     while (raw_iter.next()) |part| {
@@ -162,9 +86,7 @@ fn sanitizeRelativePath(
 
     const relative = std.mem.trimStart(u8, cleaned, "/");
     if (relative.len == 0 or cleaned[cleaned.len - 1] == '/') {
-        if (index_path) |index| {
-            return try allocator.dupe(u8, index);
-        }
+        if (index_path) |index| return try allocator.dupe(u8, index);
         return try allocator.dupe(u8, relative);
     }
 
@@ -175,221 +97,125 @@ fn contentTypeForPath(path: []const u8) []const u8 {
     const extension = std.fs.path.extension(path);
     if (extension.len == 0) return "application/octet-stream";
 
-    if (std.ascii.eqlIgnoreCase(extension, ".html")) return "text/html; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".htm") or std.ascii.eqlIgnoreCase(extension, ".html")) return "text/html; charset=utf-8";
     if (std.ascii.eqlIgnoreCase(extension, ".css")) return "text/css; charset=utf-8";
-    if (std.ascii.eqlIgnoreCase(extension, ".js") or std.ascii.eqlIgnoreCase(extension, ".mjs")) return "application/javascript; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".js") or std.ascii.eqlIgnoreCase(extension, ".mjs") or std.ascii.eqlIgnoreCase(extension, ".cjs")) return "application/javascript; charset=utf-8";
     if (std.ascii.eqlIgnoreCase(extension, ".json")) return "application/json; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".map")) return "application/json; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".webmanifest")) return "application/manifest+json; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".xml") or std.ascii.eqlIgnoreCase(extension, ".xsl") or std.ascii.eqlIgnoreCase(extension, ".xsd")) return "application/xml; charset=utf-8";
     if (std.ascii.eqlIgnoreCase(extension, ".txt")) return "text/plain; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".csv")) return "text/csv; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".tsv")) return "text/tab-separated-values; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".md")) return "text/markdown; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".toml")) return "application/toml; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".yaml") or std.ascii.eqlIgnoreCase(extension, ".yml")) return "application/yaml; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return "application/pdf";
     if (std.ascii.eqlIgnoreCase(extension, ".svg")) return "image/svg+xml";
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(extension, ".avif")) return "image/avif";
+    if (std.ascii.eqlIgnoreCase(extension, ".apng")) return "image/apng";
     if (std.ascii.eqlIgnoreCase(extension, ".png")) return "image/png";
     if (std.ascii.eqlIgnoreCase(extension, ".jpg") or std.ascii.eqlIgnoreCase(extension, ".jpeg")) return "image/jpeg";
     if (std.ascii.eqlIgnoreCase(extension, ".gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(extension, ".bmp")) return "image/bmp";
     if (std.ascii.eqlIgnoreCase(extension, ".ico")) return "image/x-icon";
+    if (std.ascii.eqlIgnoreCase(extension, ".tif") or std.ascii.eqlIgnoreCase(extension, ".tiff")) return "image/tiff";
+    if (std.ascii.eqlIgnoreCase(extension, ".mp3")) return "audio/mpeg";
+    if (std.ascii.eqlIgnoreCase(extension, ".wav")) return "audio/wav";
+    if (std.ascii.eqlIgnoreCase(extension, ".ogg") or std.ascii.eqlIgnoreCase(extension, ".oga")) return "audio/ogg";
+    if (std.ascii.eqlIgnoreCase(extension, ".opus")) return "audio/opus";
+    if (std.ascii.eqlIgnoreCase(extension, ".aac")) return "audio/aac";
+    if (std.ascii.eqlIgnoreCase(extension, ".flac")) return "audio/flac";
+    if (std.ascii.eqlIgnoreCase(extension, ".m4a")) return "audio/mp4";
+    if (std.ascii.eqlIgnoreCase(extension, ".mp4")) return "video/mp4";
+    if (std.ascii.eqlIgnoreCase(extension, ".webm")) return "video/webm";
+    if (std.ascii.eqlIgnoreCase(extension, ".ogv")) return "video/ogg";
     if (std.ascii.eqlIgnoreCase(extension, ".woff")) return "font/woff";
     if (std.ascii.eqlIgnoreCase(extension, ".woff2")) return "font/woff2";
+    if (std.ascii.eqlIgnoreCase(extension, ".ttf")) return "font/ttf";
+    if (std.ascii.eqlIgnoreCase(extension, ".otf")) return "font/otf";
+    if (std.ascii.eqlIgnoreCase(extension, ".eot")) return "application/vnd.ms-fontobject";
     if (std.ascii.eqlIgnoreCase(extension, ".wasm")) return "application/wasm";
-    if (std.ascii.eqlIgnoreCase(extension, ".map")) return "application/json; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(extension, ".zip")) return "application/zip";
+    if (std.ascii.eqlIgnoreCase(extension, ".gz")) return "application/gzip";
+    if (std.ascii.eqlIgnoreCase(extension, ".br")) return "application/x-brotli";
+    if (std.ascii.eqlIgnoreCase(extension, ".bz2")) return "application/x-bzip2";
+    if (std.ascii.eqlIgnoreCase(extension, ".7z")) return "application/x-7z-compressed";
+    if (std.ascii.eqlIgnoreCase(extension, ".rar")) return "application/vnd.rar";
+    if (std.ascii.eqlIgnoreCase(extension, ".tar")) return "application/x-tar";
+    if (std.ascii.eqlIgnoreCase(extension, ".tgz")) return "application/gzip";
     return "application/octet-stream";
 }
 
-fn selectStaticAsset(
-    req: Request,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    full_path: []const u8,
-    relative_path: []const u8,
-    static_options: ServeStaticOptions,
-) !SelectedAsset {
-    if (static_options.prefer_precompressed_gzip and acceptsEncoding(req, "gzip")) {
-        const gzip_relative = try std.fmt.allocPrint(allocator, "{s}.gz", .{relative_path});
-        defer allocator.free(gzip_relative);
-        const gzip_full = try std.fmt.allocPrint(allocator, "{s}.gz", .{full_path});
-        errdefer allocator.free(gzip_full);
+test "serveStatic serves files from the configured root" {
+    var app = @import("app.zig").App.init(std.testing.allocator);
+    defer app.deinit();
 
-        const gzip_stat = std.Io.Dir.cwd().statFile(io, gzip_full, .{}) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (gzip_stat) |stat| {
-            return .{
-                .path = gzip_full,
-                .stat = stat,
-                .gzip_encoded = true,
-            };
+    try app.use(serveStatic(.{ .root = "testdata/static" }));
+
+    var res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .GET, "/hello.txt"));
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", res.content_type);
+    try std.testing.expectEqualStrings("hello\n", res.body);
+}
+
+test "serveStatic falls through when the file is missing" {
+    var app = @import("app.zig").App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.use(serveStatic(.{ .root = "testdata/static" }));
+    try app.get("/missing.txt", struct {
+        fn run(c: *Context) Response {
+            return c.text("fallback");
         }
-    }
+    }.run);
 
-    return .{
-        .path = full_path,
-        .stat = try std.Io.Dir.cwd().statFile(io, full_path, .{}),
-    };
-}
+    var res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .GET, "/missing.txt"));
+    defer res.deinit();
 
-fn acceptsEncoding(req: Request, encoding: []const u8) bool {
-    const header = req.header("accept-encoding") orelse return false;
-    var iter = std.mem.splitScalar(u8, header, ',');
-    while (iter.next()) |part| {
-        const token = std.mem.trim(u8, part, " \t");
-        if (std.mem.startsWith(u8, token, encoding)) return true;
-        if (std.mem.eql(u8, token, "*")) return true;
-    }
-    return false;
-}
-
-fn formatStatETag(allocator: std.mem.Allocator, stat: std.Io.File.Stat) std.mem.Allocator.Error![]const u8 {
-    return try std.fmt.allocPrint(allocator, "W/\"{x}-{x}\"", .{
-        stat.size,
-        stat.mtime.toNanoseconds(),
-    });
-}
-
-fn formatHttpDate(allocator: std.mem.Allocator, timestamp: std.Io.Timestamp) std.mem.Allocator.Error![]const u8 {
-    const EpochSeconds = std.time.epoch.EpochSeconds;
-    const expires: EpochSeconds = .{ .secs = @intCast(@max(timestamp.toSeconds(), 0)) };
-    const weekday_names = [_][]const u8{
-        "Sun",
-        "Mon",
-        "Tue",
-        "Wed",
-        "Thu",
-        "Fri",
-        "Sat",
-    };
-    const month_names = [_][]const u8{
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sep",
-        "Oct",
-        "Nov",
-        "Dec",
-    };
-
-    const epoch_day = expires.getEpochDay();
-    const day_seconds = expires.getDaySeconds();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const weekday_index: usize = @intCast((epoch_day.day + 4) % 7);
-
-    return try std.fmt.allocPrint(allocator, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        weekday_names[weekday_index],
-        month_day.day_index + 1,
-        month_names[@intFromEnum(month_day.month) - 1],
-        year_day.year,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    });
-}
-
-test "serveStatic serves files from a catch-all route" {
-    const root = ".zig-cache/test-static-assets";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = root ++ "/app.js",
-        .data = "console.log('zono');",
-    });
-
-    var app = @import("app.zig").App.init(std.testing.allocator);
-    defer app.deinit();
-    try app.get("/assets/*path", serveStatic(.{
-        .root = root,
-        .cache_control = "public, max-age=60",
-    }));
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/assets/app.js"));
     try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("console.log('zono');", res.body);
-    try std.testing.expectEqualStrings("application/javascript; charset=utf-8", res.content_type);
-    try std.testing.expectEqualStrings("public, max-age=60", responseHeaderValue(res, "cache-control").?);
+    try std.testing.expectEqualStrings("fallback", res.body);
 }
 
-test "serveStatic serves index files for directory-like requests" {
-    const root = ".zig-cache/test-static-index";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = root ++ "/index.html",
-        .data = "<h1>home</h1>",
-    });
-
-    var app = @import("app.zig").App.init(std.testing.allocator);
-    defer app.deinit();
-    try app.get("/*path", serveStatic(.{
-        .root = root,
-    }));
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("<h1>home</h1>", res.body);
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", res.content_type);
+test "serveStatic infers common content types" {
+    try std.testing.expectEqualStrings("application/manifest+json; charset=utf-8", contentTypeForPath("site.webmanifest"));
+    try std.testing.expectEqualStrings("application/xml; charset=utf-8", contentTypeForPath("feed.xml"));
+    try std.testing.expectEqualStrings("image/webp", contentTypeForPath("image.webp"));
+    try std.testing.expectEqualStrings("video/mp4", contentTypeForPath("clip.mp4"));
+    try std.testing.expectEqualStrings("font/ttf", contentTypeForPath("font.ttf"));
+    try std.testing.expectEqualStrings("application/gzip", contentTypeForPath("archive.gz"));
 }
 
-test "serveStatic prevents path traversal and returns not found" {
-    const root = ".zig-cache/test-static-safe";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
-
+test "serveStatic serves index files and strips body for HEAD" {
     var app = @import("app.zig").App.init(std.testing.allocator);
     defer app.deinit();
-    try app.get("/assets/*path", serveStatic(.{
-        .root = root,
-    }));
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    try app.use(serveStatic(.{ .root = "testdata/static" }));
 
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/assets/../../secret.txt"));
+    var get_res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .GET, "/"));
+    defer get_res.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, get_res.status);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", get_res.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, get_res.body, "zono static index") != null);
+
+    var head_res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .HEAD, "/"));
+    defer head_res.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, head_res.status);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", head_res.content_type);
+    try std.testing.expectEqualStrings("", head_res.body);
+}
+
+test "serveStatic blocks path traversal attempts" {
+    var app = @import("app.zig").App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.use(serveStatic(.{ .root = "testdata/static" }));
+
+    var res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .GET, "/../secret.txt"));
+    defer res.deinit();
+
     try std.testing.expectEqual(std.http.Status.not_found, res.status);
-}
-
-test "serveStatic emits etag and returns 304 for matching if-none-match" {
-    const root = ".zig-cache/test-static-etag";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = root ++ "/asset.txt",
-        .data = "etag",
-    });
-
-    var app = @import("app.zig").App.init(std.testing.allocator);
-    defer app.deinit();
-    try app.get("/assets/*path", serveStatic(.{
-        .root = root,
-    }));
-
-    const first = Request.init(std.testing.allocator, .GET, "/assets/asset.txt");
-    var first_res = app.handle(first);
-    defer first_res.deinit();
-    const tag = responseHeaderValue(first_res, "etag").?;
-
-    var second = Request.init(std.testing.allocator, .GET, "/assets/asset.txt");
-    second.header_list = &.{
-        .{ .name = "if-none-match", .value = tag },
-    };
-    var second_res = app.handle(second);
-    defer second_res.deinit();
-
-    try std.testing.expectEqual(std.http.Status.not_modified, second_res.status);
-}
-
-fn responseHeaderValue(res: Response, name: []const u8) ?[]const u8 {
-    if (std.ascii.eqlIgnoreCase(name, "content-type")) return if (res.content_type.len > 0) res.content_type else null;
-
-    for (res.extraHeaders()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
-    }
-    return null;
 }

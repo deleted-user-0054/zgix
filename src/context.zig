@@ -1,22 +1,16 @@
 const std = @import("std");
 const request_mod = @import("request.zig");
 const Request = request_mod.Request;
-const MatchedRoute = request_mod.MatchedRoute;
-const ValidationTarget = request_mod.ValidationTarget;
 const Response = @import("response.zig").Response;
-const http_exception_mod = @import("http_exception.zig");
-const HTTPException = http_exception_mod.HTTPException;
-const StoredHTTPException = http_exception_mod.StoredHTTPException;
-const realtime_mod = @import("realtime.zig");
+const response_mod = @import("response.zig");
 const Handler = @import("router.zig").Handler;
+const websocket_mod = @import("websocket.zig");
 
 const VariableEntry = struct {
     value: *anyopaque,
     type_name: []const u8,
     deinit_fn: *const fn (allocator: std.mem.Allocator, value: *anyopaque) void,
 };
-
-const RendererFn = *const fn (ctx: *anyopaque, content: []const u8) Response;
 
 pub const SharedState = struct {
     allocator: std.mem.Allocator,
@@ -26,28 +20,17 @@ pub const SharedState = struct {
         .body = "",
     },
     variables: std.StringHashMapUnmanaged(VariableEntry) = .empty,
-    validated: std.StringHashMapUnmanaged(VariableEntry) = .empty,
-    matched_routes: std.ArrayListUnmanaged(MatchedRoute) = .empty,
-    renderer: ?RendererFn = null,
     not_found_handler: ?Handler = null,
     on_error_handler: ?*const fn (err: anyerror, req: Request) Response = null,
-    route_path: ?[]const u8 = null,
-    base_route_path: ?[]const u8 = null,
-    http_exception: ?StoredHTTPException = null,
     last_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator) SharedState {
-        return .{
-            .allocator = allocator,
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *SharedState) void {
         self.response.deinit();
         deinitVariableMap(self.allocator, &self.variables);
-        deinitVariableMap(self.allocator, &self.validated);
-        self.matched_routes.deinit(self.allocator);
-        if (self.http_exception) |*exception| exception.deinit(self.allocator);
     }
 
     pub fn set(self: *SharedState, key: []const u8, value: anytype) std.mem.Allocator.Error!void {
@@ -60,42 +43,6 @@ pub const SharedState = struct {
 
     pub fn contains(self: *const SharedState, key: []const u8) bool {
         return self.variables.contains(key);
-    }
-
-    pub fn setValid(self: *SharedState, comptime target: ValidationTarget, value: anytype) std.mem.Allocator.Error!void {
-        try putVariableValue(self.allocator, &self.validated, validationKey(target), value);
-    }
-
-    pub fn getValid(self: *const SharedState, comptime T: type, comptime target: ValidationTarget) ?T {
-        return getVariableValue(&self.validated, T, validationKey(target));
-    }
-
-    pub fn lookupValid(self: *const SharedState, target: ValidationTarget, type_name: []const u8) ?*const anyopaque {
-        return lookupVariableValue(&self.validated, validationKey(target), type_name);
-    }
-
-    pub fn appendMatchedRoute(self: *SharedState, route: MatchedRoute) std.mem.Allocator.Error!void {
-        try self.matched_routes.append(self.allocator, route);
-    }
-
-    pub fn setRoutePath(self: *SharedState, path: ?[]const u8) void {
-        self.route_path = path;
-    }
-
-    pub fn setBaseRoutePath(self: *SharedState, path: ?[]const u8) void {
-        self.base_route_path = path;
-    }
-
-    pub fn setHttpException(self: *SharedState, exception: HTTPException) std.mem.Allocator.Error!void {
-        if (self.http_exception) |*existing| existing.deinit(self.allocator);
-        self.http_exception = try StoredHTTPException.init(self.allocator, exception);
-    }
-
-    pub fn getHttpException(self: *const SharedState) ?HTTPException {
-        return if (self.http_exception) |exception|
-            exception.view()
-        else
-            null;
     }
 };
 
@@ -112,16 +59,6 @@ pub const Context = struct {
         }
     };
 
-    req: Request,
-    res: *Response,
-    state: *SharedState,
-    vars: Var,
-    raw: ?*const anyopaque = null,
-    env: ?*const anyopaque = null,
-    executionCtx: ?*const anyopaque = null,
-    event: ?*const anyopaque = null,
-    err: ?anyerror = null,
-
     pub const Next = struct {
         ctx: *Context,
         next_ctx: *const anyopaque,
@@ -133,6 +70,12 @@ pub const Context = struct {
         }
     };
 
+    req: Request,
+    res: *Response,
+    state: *SharedState,
+    vars: Var,
+    err: ?anyerror = null,
+
     pub fn init(req: Request) Context {
         const raw_state = req.contextState() orelse @panic("Context requires a request with initialized context state.");
         const state: *SharedState = @ptrCast(@alignCast(raw_state));
@@ -140,13 +83,7 @@ pub const Context = struct {
             .req = req,
             .res = &state.response,
             .state = state,
-            .vars = .{
-                .state = state,
-            },
-            .raw = req.raw,
-            .env = req.env,
-            .executionCtx = req.executionCtx,
-            .event = req.event,
+            .vars = .{ .state = state },
             .err = state.last_error,
         };
     }
@@ -169,54 +106,6 @@ pub const Context = struct {
 
     pub fn get(self: *Context, comptime T: type, key: []const u8) ?T {
         return self.state.get(T, key);
-    }
-
-    pub fn setValid(self: *Context, comptime target: ValidationTarget, value: anytype) std.mem.Allocator.Error!void {
-        try self.state.setValid(target, value);
-    }
-
-    pub fn valid(self: *Context, comptime T: type, comptime target: ValidationTarget) ?T {
-        return self.req.valid(T, target);
-    }
-
-    pub fn routePath(self: *Context) ?[]const u8 {
-        return self.req.routePath();
-    }
-
-    pub fn baseRoutePath(self: *Context) ?[]const u8 {
-        return self.req.baseRoutePath();
-    }
-
-    pub fn matchedRoutes(self: *Context) []const MatchedRoute {
-        return self.req.matchedRoutes();
-    }
-
-    pub fn httpException(self: *Context) ?HTTPException {
-        return self.req.httpException();
-    }
-
-    pub fn throw(self: *Context, exception: HTTPException) http_exception_mod.ThrowError {
-        return self.req.throw(exception);
-    }
-
-    pub fn rawAs(self: *Context, comptime T: type) ?*const T {
-        return self.req.rawAs(T);
-    }
-
-    pub fn envAs(self: *Context, comptime T: type) ?*const T {
-        return self.req.envAs(T);
-    }
-
-    pub fn executionCtxAs(self: *Context, comptime T: type) ?*const T {
-        return self.req.executionCtxAs(T);
-    }
-
-    pub fn eventAs(self: *Context, comptime T: type) ?*const T {
-        return self.req.eventAs(T);
-    }
-
-    pub fn setRenderer(self: *Context, comptime renderer: anytype) void {
-        self.state.renderer = resolveRenderer(renderer);
     }
 
     pub fn body(self: *Context, content: []const u8, content_type: []const u8) Response {
@@ -256,7 +145,7 @@ pub const Context = struct {
 
         var out: std.Io.Writer.Allocating = .init(self.req.allocator);
         var stringify: std.json.Stringify = .{ .writer = &out.writer };
-        stringify.write(value) catch return @import("response.zig").internalError("json write failed");
+        stringify.write(value) catch return response_mod.internalError("json write failed");
         return self.body(out.written(), "application/json; charset=utf-8");
     }
 
@@ -265,64 +154,11 @@ pub const Context = struct {
         return self.json(value);
     }
 
-    pub fn render(self: *Context, content: anytype) Response {
-        const ContentType = @TypeOf(content);
-        if (!comptime isStringLike(ContentType)) {
-            @compileError("Context.render accepts string-like content.");
-        }
-
-        const content_slice: []const u8 = content;
-        const response = if (self.state.renderer) |renderer|
-            renderer(@ptrCast(self), content_slice)
-        else
-            self.html(content_slice);
-
-        self.mergeResponse(response);
-        return self.takeResponse();
-    }
-
-    pub fn sse(self: *Context, events: anytype) Response {
-        const response = realtime_mod.sse(self.req.allocator, events) catch return @import("response.zig").internalError("sse write failed");
-        self.mergeResponse(response);
-        return self.takeResponse();
-    }
-
-    pub fn stream(self: *Context, comptime handler: anytype, stream_options: @import("response.zig").StreamOptions) Response {
-        const response = realtime_mod.stream(self.req, handler, stream_options);
-        self.mergeResponse(response);
-        return self.takeResponse();
-    }
-
-    pub fn streamSSE(self: *Context, comptime handler: anytype) Response {
-        const response = realtime_mod.streamSSE(self.req, handler);
-        self.mergeResponse(response);
-        return self.takeResponse();
-    }
-
-    pub fn acceptWebSocket(
-        self: *Context,
-        websocket_options: realtime_mod.WebSocketAcceptOptions,
-    ) realtime_mod.WebSocketUpgradeError!Response {
-        const response = try realtime_mod.acceptWebSocket(self.req, websocket_options);
-        self.mergeResponse(response);
-        return self.takeResponse();
-    }
-
-    pub fn upgradeWebSocket(
-        self: *Context,
-        comptime handler: anytype,
-        websocket_options: realtime_mod.UpgradeWebSocketOptions,
-    ) Response {
-        const response = realtime_mod.upgradeWebSocket(self.req, handler, websocket_options);
-        self.mergeResponse(response);
-        return self.takeResponse();
-    }
-
     pub fn notFound(self: *Context) Response {
         const response = if (self.state.not_found_handler) |handler|
             handler(self.req)
         else
-            @import("response.zig").notFound();
+            response_mod.notFound();
 
         self.mergeResponse(response);
         return self.takeResponse();
@@ -337,20 +173,24 @@ pub const Context = struct {
         return self.takeResponse();
     }
 
+    pub fn upgradeWebSocket(self: *Context, comptime handler: anytype, options: websocket_mod.WebSocketUpgradeOptions) Response {
+        return websocket_mod.upgradeWebSocket(self.req, handler, options);
+    }
+
     pub fn cookie(
         self: *Context,
         name: []const u8,
         value: []const u8,
-        cookie_options: @import("response.zig").CookieOptions,
-    ) @import("response.zig").CookieError!void {
+        cookie_options: response_mod.CookieOptions,
+    ) response_mod.CookieError!void {
         try self.res.cookie(self.req.allocator, name, value, cookie_options);
     }
 
     pub fn deleteCookie(
         self: *Context,
         name: []const u8,
-        delete_options: @import("response.zig").DeleteCookieOptions,
-    ) @import("response.zig").CookieError!void {
+        delete_options: response_mod.DeleteCookieOptions,
+    ) response_mod.CookieError!void {
         try self.res.deleteCookie(self.req.allocator, name, delete_options);
     }
 
@@ -395,51 +235,6 @@ pub const Context = struct {
         self.res = &self.state.response;
     }
 };
-
-pub fn lookupValidatedValue(
-    ctx: *const anyopaque,
-    target: ValidationTarget,
-    type_name: []const u8,
-) ?*const anyopaque {
-    const state: *const SharedState = @ptrCast(@alignCast(ctx));
-    return state.lookupValid(target, type_name);
-}
-
-pub fn lookupRoutePath(ctx: *const anyopaque) ?[]const u8 {
-    const state: *const SharedState = @ptrCast(@alignCast(ctx));
-    return state.route_path;
-}
-
-pub fn lookupBaseRoutePath(ctx: *const anyopaque) ?[]const u8 {
-    const state: *const SharedState = @ptrCast(@alignCast(ctx));
-    return state.base_route_path;
-}
-
-pub fn lookupMatchedRoutes(ctx: *const anyopaque) []const MatchedRoute {
-    const state: *const SharedState = @ptrCast(@alignCast(ctx));
-    return state.matched_routes.items;
-}
-
-pub fn storeHttpException(ctx: *const anyopaque, exception: HTTPException) std.mem.Allocator.Error!void {
-    const state: *SharedState = @ptrCast(@alignCast(@constCast(ctx)));
-    try state.setHttpException(exception);
-}
-
-pub fn lookupHttpException(ctx: *const anyopaque) ?HTTPException {
-    const state: *const SharedState = @ptrCast(@alignCast(ctx));
-    return state.getHttpException();
-}
-
-fn validationKey(target: ValidationTarget) []const u8 {
-    return switch (target) {
-        .form => "form",
-        .json => "json",
-        .query => "query",
-        .header => "header",
-        .cookie => "cookie",
-        .param => "param",
-    };
-}
 
 fn putVariableValue(
     allocator: std.mem.Allocator,
@@ -486,16 +281,6 @@ fn getVariableValue(
     return typed_value.*;
 }
 
-fn lookupVariableValue(
-    map: *const std.StringHashMapUnmanaged(VariableEntry),
-    key: []const u8,
-    type_name: []const u8,
-) ?*const anyopaque {
-    const entry = map.get(key) orelse return null;
-    if (!std.mem.eql(u8, entry.type_name, type_name)) return null;
-    return entry.value;
-}
-
 fn deinitVariableMap(
     allocator: std.mem.Allocator,
     map: *std.StringHashMapUnmanaged(VariableEntry),
@@ -507,51 +292,6 @@ fn deinitVariableMap(
     }
     map.deinit(allocator);
     map.* = .empty;
-}
-
-fn resolveRenderer(comptime target: anytype) RendererFn {
-    const TargetType = @TypeOf(target);
-    return switch (comptime @typeInfo(TargetType)) {
-        .@"fn" => resolveRendererFn(target, TargetType),
-        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
-            .@"fn" => resolveRendererFn(target, pointer.child),
-            else => @compileError("Context.setRenderer requires fn(content: []const u8) zono.Response or fn(c: *zono.Context, content: []const u8) zono.Response."),
-        },
-        else => @compileError("Context.setRenderer requires fn(content: []const u8) zono.Response or fn(c: *zono.Context, content: []const u8) zono.Response."),
-    };
-}
-
-fn resolveRendererFn(comptime target: anytype, comptime FnType: type) RendererFn {
-    const info = @typeInfo(FnType).@"fn";
-    if (info.return_type == null or info.return_type.? != Response) {
-        @compileError("Context renderer functions must return zono.Response.");
-    }
-    if (info.params.len == 1 and info.params[0].type != null and info.params[0].type.? == []const u8) {
-        return wrapPlainRenderer(target);
-    }
-    if (info.params.len == 2 and info.params[0].type != null and info.params[0].type.? == *Context and info.params[1].type != null and info.params[1].type.? == []const u8) {
-        return wrapContextRenderer(target);
-    }
-
-    @compileError("Context.setRenderer requires fn(content: []const u8) zono.Response or fn(c: *zono.Context, content: []const u8) zono.Response.");
-}
-
-fn wrapPlainRenderer(comptime target: anytype) RendererFn {
-    return struct {
-        fn run(ctx: *anyopaque, content: []const u8) Response {
-            _ = ctx;
-            return target(content);
-        }
-    }.run;
-}
-
-fn wrapContextRenderer(comptime target: anytype) RendererFn {
-    return struct {
-        fn run(ctx: *anyopaque, content: []const u8) Response {
-            const context: *Context = @ptrCast(@alignCast(ctx));
-            return target(context, content);
-        }
-    }.run;
 }
 
 fn deinitValueFn(comptime T: type) *const fn (allocator: std.mem.Allocator, value: *anyopaque) void {

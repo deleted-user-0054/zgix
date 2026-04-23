@@ -1,14 +1,8 @@
 const std = @import("std");
 const request_mod = @import("request.zig");
 const Request = request_mod.Request;
-const MatchedRoute = request_mod.MatchedRoute;
-const MatchedRouteKind = request_mod.MatchedRouteKind;
 const Response = @import("response.zig").Response;
 const response_mod = @import("response.zig");
-const adapter_mod = @import("adapter.zig");
-const http_exception_mod = @import("http_exception.zig");
-const validator_mod = @import("validator.zig");
-const route_helper_mod = @import("route_helper.zig");
 const path_mod = @import("path.zig");
 const router_mod = @import("router.zig");
 const context_mod = @import("context.zig");
@@ -17,17 +11,6 @@ const Route = router_mod.Route;
 const Router = router_mod.Router;
 const Handler = router_mod.Handler;
 const ErrorHandler = *const fn (err: anyerror, req: Request) Response;
-
-fn RouteOnErrorMarker(comptime handler: ErrorHandler) type {
-    return struct {
-        pub const is_route_on_error = true;
-        pub const route_error_handler = handler;
-    };
-}
-
-pub fn routeOnError(comptime handler: anytype) RouteOnErrorMarker(resolveErrorHandler(handler).handler) {
-    return .{};
-}
 
 pub const App = struct {
     const Self = @This();
@@ -43,44 +26,25 @@ pub const App = struct {
 
     const MiddlewareEntry = struct {
         prefix: []const u8,
-        handler: Middleware,
+        handler: DispatchMiddleware,
     };
 
-    pub const Next = struct {
+    const DispatchNext = struct {
         ctx: *const anyopaque,
         run_fn: *const fn (ctx: *const anyopaque, req: Request) Response,
 
-        pub fn run(self: Next, req: Request) Response {
+        pub fn run(self: DispatchNext, req: Request) Response {
             return self.run_fn(self.ctx, req);
         }
     };
 
-    pub const Middleware = *const fn (req: Request, next: Next) Response;
+    const DispatchMiddleware = *const fn (req: Request, next: DispatchNext) Response;
 
     pub const RequestOptions = struct {
         method: std.http.Method = .GET,
         headers: []const std.http.Header = &.{},
         body: []const u8 = "",
         cookies_raw: ?[]const u8 = null,
-        raw: ?*const anyopaque = null,
-        env: ?*const anyopaque = null,
-        executionCtx: ?*const anyopaque = null,
-        event: ?*const anyopaque = null,
-    };
-
-    pub const RawRequest = struct {
-        method: std.http.Method = .GET,
-        target: []const u8,
-        headers: []const std.http.Header = &.{},
-        body: []const u8 = "",
-        cookies_raw: ?[]const u8 = null,
-        raw: ?*const anyopaque = null,
-    };
-
-    pub const FetchRawOptions = struct {
-        env: ?*const anyopaque = null,
-        executionCtx: ?*const anyopaque = null,
-        event: ?*const anyopaque = null,
     };
 
     pub const Options = struct {
@@ -359,20 +323,11 @@ pub const App = struct {
         defer state.not_found_handler = previous_not_found_handler;
         defer state.on_error_handler = previous_on_error_handler;
         defer if (owns_context_state) shared_state.deinit();
-        attachSharedStateBindings(&handled_req, state);
 
-        var response = if (self.middlewares.items.len == 0)
+        return if (self.middlewares.items.len == 0)
             self.handleEndpoint(handled_req)
         else
             self.runMiddlewares(handled_req, 0);
-
-        if (owns_context_state and state.http_exception != null) {
-            const cloned = response.clone(handled_req.allocator) catch response_mod.internalError("http exception response clone failed");
-            response.deinit();
-            response = cloned;
-        }
-
-        return response;
     }
 
     fn runMiddlewares(self: *App, req: Request, start_index: usize) Response {
@@ -380,8 +335,6 @@ pub const App = struct {
         while (middleware_index < self.middlewares.items.len) : (middleware_index += 1) {
             const middleware_entry = self.middlewares.items[middleware_index];
             if (!middlewareMatches(middleware_entry.prefix, req.path, self.strict)) continue;
-
-            recordMatchedRoute(req, .middleware, matchedRoutePath(middleware_entry.prefix));
 
             const frame = MiddlewareFrame{
                 .app = self,
@@ -405,60 +358,59 @@ pub const App = struct {
             defer if (lookup.params_storage) |storage| req.allocator.free(storage);
             var routed_req = req;
             routed_req.params = lookup.params;
-            routed_req.route_path_value = lookup.route_path;
-            routed_req.base_route_path_value = lookup.base_route_path orelse req.baseRoutePath();
-            setRouteMetadata(routed_req, lookup.route_path, routed_req.base_route_path_value);
-            if (lookup.route_path) |route_path| {
-                recordMatchedRoute(routed_req, .route, route_path);
-            }
-            if (routed_req.route_lookup_ctx == null) {
-                if (lookup.route_path) |route_path| {
-                    const matched = [1]MatchedRoute{
-                        .{
-                            .path = route_path,
-                            .kind = .route,
-                        },
-                    };
-                    routed_req.matched_route_list = matched[0..];
-                    return handler(routed_req);
-                }
-            }
             return handler(routed_req);
         }
 
         if (matchMount(self.mounts.items, req.path)) |matched_mount| {
             var mounted_req = req;
             mounted_req.path = matched_mount.path;
-            mounted_req.base_route_path_value = matchedRoutePath(matched_mount.mount.prefix);
-            setBaseRoutePath(mounted_req, mounted_req.base_route_path_value);
-            recordMatchedRoute(mounted_req, .mount, matchedRoutePath(matched_mount.mount.prefix));
             return dispatchMount(matched_mount.mount.target, mounted_req);
         }
 
         if (self.redirect_trailing_slash and lookup.tsr and !std.mem.eql(u8, req.path, "/")) {
             if (trailingSlashVariant(req.allocator, req.path) catch null) |redirect_path| {
+                const owns_redirect_path = redirect_path.ptr != req.path.ptr;
                 const location = appendQuery(req.allocator, redirect_path, req.query_string) catch redirect_path;
-                return response_mod.redirect(req.method, location);
+                var res = response_mod.redirect(req.method, location);
+                if (res.ensureOwned(req.allocator)) {
+                    if (owns_redirect_path) req.allocator.free(redirect_path);
+                    if (location.ptr != redirect_path.ptr) req.allocator.free(location);
+                } else |_| {}
+                return res;
             }
         }
 
         if (self.redirect_fixed_path) {
             const cleaned = path_mod.cleanPath(req.allocator, lookup_req.path) catch lookup_req.path;
+            defer if (cleaned.ptr != lookup_req.path.ptr) req.allocator.free(cleaned);
             if (router.findCaseInsensitivePath(req.allocator, req.method, cleaned, true) catch null) |fixed| {
                 const location = appendQuery(req.allocator, fixed, req.query_string) catch fixed;
-                return response_mod.redirect(req.method, location);
+                var res = response_mod.redirect(req.method, location);
+                if (res.ensureOwned(req.allocator)) {
+                    req.allocator.free(fixed);
+                    if (location.ptr != fixed.ptr) req.allocator.free(location);
+                } else |_| {}
+                return res;
             }
         }
 
         if (req.method == .OPTIONS and self.handle_options) {
             if (router.allowed(req.allocator, lookup_req.path, req.method, self.handle_options) catch null) |allow| {
-                return response_mod.options(allow);
+                var res = response_mod.options(allow);
+                if (res.ensureOwned(req.allocator)) {
+                    req.allocator.free(allow);
+                } else |_| {}
+                return res;
             }
         }
 
         if (self.handle_method_not_allowed) {
             if (router.allowed(req.allocator, lookup_req.path, req.method, self.handle_options) catch null) |allow| {
-                return response_mod.methodNotAllowed(allow);
+                var res = response_mod.methodNotAllowed(allow);
+                if (res.ensureOwned(req.allocator)) {
+                    req.allocator.free(allow);
+                } else |_| {}
+                return res;
             }
         }
 
@@ -471,25 +423,6 @@ pub const App = struct {
 
     pub fn fetch(self: *App, req: Request) Response {
         return self.handle(req);
-    }
-
-    pub fn fetchRaw(self: *App, allocator: std.mem.Allocator, raw_request: RawRequest, fetch_options: FetchRawOptions) !Response {
-        return try self.request(allocator, raw_request.target, .{
-            .method = raw_request.method,
-            .headers = raw_request.headers,
-            .body = raw_request.body,
-            .cookies_raw = raw_request.cookies_raw,
-            .raw = raw_request.raw,
-            .env = fetch_options.env,
-            .executionCtx = fetch_options.executionCtx,
-            .event = fetch_options.event,
-        });
-    }
-
-    pub fn fetchRawResponse(self: *App, allocator: std.mem.Allocator, raw_request: RawRequest, fetch_options: FetchRawOptions) !adapter_mod.RawResponse {
-        var response = try self.fetchRaw(allocator, raw_request, fetch_options);
-        defer response.deinit();
-        return try adapter_mod.fromResponse(allocator, response);
     }
 
     pub fn request(self: *App, allocator: std.mem.Allocator, input: anytype, req_options: RequestOptions) !Response {
@@ -541,25 +474,15 @@ pub const App = struct {
         req.header_list = req_options.headers;
         req.body = req_options.body;
         req.cookies_raw = req_options.cookies_raw orelse "";
-        req.raw = req_options.raw;
-        req.env = req_options.env;
-        req.executionCtx = req_options.executionCtx;
-        req.event = req_options.event;
 
         var response = self.handle(req);
         defer response.deinit();
-        if (response.runtime != .none) {
-            return try response_mod.internalError("runtime responses are not supported by app.request").clone(allocator);
-        }
         return try response.clone(allocator);
     }
 
     fn cloneHandledResponse(self: *App, allocator: std.mem.Allocator, req: Request) !Response {
         var response = self.handle(req);
         defer response.deinit();
-        if (response.runtime != .none) {
-            return try response_mod.internalError("runtime responses are not supported by app.request").clone(allocator);
-        }
         return try response.clone(allocator);
     }
 
@@ -675,46 +598,6 @@ const MiddlewareFrame = struct {
 fn runMiddlewareNext(ctx: *const anyopaque, req: Request) Response {
     const frame: *const MiddlewareFrame = @ptrCast(@alignCast(ctx));
     return frame.app.runMiddlewares(req, frame.next_index);
-}
-
-fn attachSharedStateBindings(req: *Request, state: *context_mod.SharedState) void {
-    req.validation_lookup_ctx = @ptrCast(state);
-    req.validation_lookup_fn = context_mod.lookupValidatedValue;
-    req.route_lookup_ctx = @ptrCast(state);
-    req.route_path_lookup_fn = context_mod.lookupRoutePath;
-    req.base_route_path_lookup_fn = context_mod.lookupBaseRoutePath;
-    req.matched_routes_lookup_fn = context_mod.lookupMatchedRoutes;
-    req.http_exception_ctx = @ptrCast(state);
-    req.http_exception_store_fn = context_mod.storeHttpException;
-    req.http_exception_load_fn = context_mod.lookupHttpException;
-}
-
-fn sharedState(req: Request) ?*context_mod.SharedState {
-    const raw_state = req.route_lookup_ctx orelse req.validation_lookup_ctx orelse req.http_exception_ctx orelse return null;
-    return @ptrCast(@alignCast(@constCast(raw_state)));
-}
-
-fn matchedRoutePath(path: []const u8) []const u8 {
-    return if (path.len == 0) "/" else path;
-}
-
-fn setRouteMetadata(req: Request, route_path: ?[]const u8, base_route_path: ?[]const u8) void {
-    const state = sharedState(req) orelse return;
-    state.setRoutePath(route_path);
-    state.setBaseRoutePath(base_route_path);
-}
-
-fn setBaseRoutePath(req: Request, base_route_path: ?[]const u8) void {
-    const state = sharedState(req) orelse return;
-    state.setBaseRoutePath(base_route_path);
-}
-
-fn recordMatchedRoute(req: Request, kind: MatchedRouteKind, path: []const u8) void {
-    const state = sharedState(req) orelse return;
-    state.appendMatchedRoute(.{
-        .path = path,
-        .kind = kind,
-    }) catch {};
 }
 
 const MountMatch = struct {
@@ -875,7 +758,7 @@ const ResolvedHandler = struct {
 };
 
 const ResolvedMiddleware = struct {
-    handler: App.Middleware,
+    handler: App.DispatchMiddleware,
     uses_context: bool,
     uses_error: bool,
 };
@@ -902,9 +785,9 @@ fn resolveHandler(target: anytype) ResolvedHandler {
         .@"fn" => resolveHandlerFn(target, TargetType),
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
             .@"fn" => resolveHandlerFn(target, pointer.child),
-            else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, or fn(c: *zono.Context) !zono.Response."),
+            else => @compileError("Route handlers must be fn(c: *zono.Context) zono.Response or fn(c: *zono.Context) !zono.Response."),
         },
-        else => @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, fn(c: *zono.Context) !zono.Response, or a tuple like .{ middleware, handler }."),
+        else => @compileError("Route handlers must be fn(c: *zono.Context) zono.Response, fn(c: *zono.Context) !zono.Response, or a tuple like .{ middleware, handler }."),
     };
 }
 
@@ -916,20 +799,6 @@ fn resolveHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedHan
     }
 
     const ParamType = info.params[0].type.?;
-    if (ParamType == Request) {
-        if (returns_error) {
-            return .{
-                .handler = wrapErrorHandler(target),
-                .uses_context = false,
-                .uses_error = true,
-            };
-        }
-        return .{
-            .handler = target,
-            .uses_context = false,
-            .uses_error = false,
-        };
-    }
     if (ParamType == *Context) {
         if (returns_error) {
             return .{
@@ -945,15 +814,7 @@ fn resolveHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedHan
         };
     }
 
-    @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, or fn(c: *zono.Context) !zono.Response.");
-}
-
-fn isRouteOnErrorMarker(comptime T: type) bool {
-    const info = @typeInfo(T);
-    if (info == .@"struct" or info == .@"enum" or info == .@"union") {
-        return @hasDecl(T, "is_route_on_error") and @hasDecl(T, "route_error_handler");
-    }
-    return false;
+    @compileError("Route handlers must be fn(c: *zono.Context) zono.Response or fn(c: *zono.Context) !zono.Response.");
 }
 
 fn resolveHandlerChain(target: anytype, comptime TargetType: type) ResolvedHandler {
@@ -962,7 +823,6 @@ fn resolveHandlerChain(target: anytype, comptime TargetType: type) ResolvedHandl
         @compileError("Route handler tuples must contain at least one handler.");
     }
 
-    comptime var uses_context = false;
     comptime var uses_error = false;
 
     if (fields.len == 1) {
@@ -970,84 +830,50 @@ fn resolveHandlerChain(target: anytype, comptime TargetType: type) ResolvedHandl
         return resolved;
     }
 
-    comptime var route_error_handler: ?ErrorHandler = null;
-    comptime var middleware_count: usize = 0;
+    const middleware_count = fields.len - 1;
     inline for (fields[0 .. fields.len - 1]) |field| {
         const item = @field(target, field.name);
-        if (comptime isRouteOnErrorMarker(@TypeOf(item))) {
-            if (route_error_handler != null) {
-                @compileError("Route handler tuples may include only one zono.routeOnError(...) marker.");
-            }
-            route_error_handler = @TypeOf(item).route_error_handler;
-            uses_error = true;
-            continue;
-        }
-
         const resolved = comptime resolveMiddlewareHandler(item);
-        middleware_count += 1;
-        uses_context = uses_context or resolved.uses_context;
         uses_error = uses_error or resolved.uses_error;
     }
 
-    comptime var middlewares: [middleware_count]App.Middleware = undefined;
+    comptime var middlewares: [middleware_count]App.DispatchMiddleware = undefined;
     comptime var middleware_index: usize = 0;
     inline for (fields[0 .. fields.len - 1]) |field| {
         const item = @field(target, field.name);
-        if (comptime isRouteOnErrorMarker(@TypeOf(item))) continue;
-
         const resolved = comptime resolveMiddlewareHandler(item);
         middlewares[middleware_index] = resolved.handler;
         middleware_index += 1;
     }
 
     const final_resolved = comptime resolveHandler(@field(target, fields[fields.len - 1].name));
-    uses_context = uses_context or final_resolved.uses_context;
     uses_error = uses_error or final_resolved.uses_error;
 
-    const chained_handler = if (route_error_handler) |handler|
-        wrapRouteOnError(handler, wrapRouteChain(middlewares, final_resolved.handler))
-    else
-        wrapRouteChain(middlewares, final_resolved.handler);
-
     return .{
-        .handler = chained_handler,
-        .uses_context = uses_context,
+        .handler = wrapRouteChain(middlewares, final_resolved.handler),
+        .uses_context = true,
         .uses_error = uses_error,
     };
 }
 
 fn resolveMiddlewareHandler(target: anytype) ResolvedMiddleware {
     const TargetType = @TypeOf(target);
-    if (TargetType == App.Middleware) {
+    if (TargetType == App.DispatchMiddleware) {
         return .{
             .handler = target,
-            .uses_context = false,
+            .uses_context = true,
             .uses_error = false,
         };
-    }
-
-    if (comptime isValidatorMarker(TargetType)) {
-        const validator_options = comptime if (@hasDecl(TargetType, "validator_options")) TargetType.validator_options else validator_mod.ValidatorOptions{};
-        const wrapped = comptime validator_mod.wrapValidator(TargetType.validator_target, TargetType.validator_parser, validator_options);
-        return resolveMiddlewareFn(wrapped, @typeInfo(@TypeOf(wrapped)).pointer.child);
     }
 
     return switch (comptime @typeInfo(TargetType)) {
         .@"fn" => resolveMiddlewareFn(target, TargetType),
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
             .@"fn" => resolveMiddlewareFn(target, pointer.child),
-            else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response, fn(req: zono.Request, next: zono.App.Next) !zono.Response, fn(c: *zono.Context, next: zono.Context.Next) zono.Response, or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response."),
+            else => @compileError("App.use middleware must be fn(c: *zono.Context, next: zono.Context.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response."),
         },
-        else => @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response, fn(req: zono.Request, next: zono.App.Next) !zono.Response, fn(c: *zono.Context, next: zono.Context.Next) zono.Response, or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response."),
+        else => @compileError("App.use middleware must be fn(c: *zono.Context, next: zono.Context.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response."),
     };
-}
-
-fn isValidatorMarker(comptime T: type) bool {
-    const info = @typeInfo(T);
-    if (info == .@"struct" or info == .@"enum" or info == .@"union") {
-        return @hasDecl(T, "is_validator") and @hasDecl(T, "validator_target") and @hasDecl(T, "validator_parser");
-    }
-    return false;
 }
 
 fn resolveMiddlewareFn(comptime target: anytype, comptime FnType: type) ResolvedMiddleware {
@@ -1059,20 +885,6 @@ fn resolveMiddlewareFn(comptime target: anytype, comptime FnType: type) Resolved
 
     const FirstParam = info.params[0].type.?;
     const SecondParam = info.params[1].type.?;
-    if (FirstParam == Request and SecondParam == App.Next) {
-        if (returns_error) {
-            return .{
-                .handler = wrapErrorMiddleware(target),
-                .uses_context = false,
-                .uses_error = true,
-            };
-        }
-        return .{
-            .handler = target,
-            .uses_context = false,
-            .uses_error = false,
-        };
-    }
     if (FirstParam == *Context and SecondParam == Context.Next) {
         if (returns_error) {
             return .{
@@ -1088,7 +900,7 @@ fn resolveMiddlewareFn(comptime target: anytype, comptime FnType: type) Resolved
         };
     }
 
-    @compileError("App.use middleware must be fn(req: zono.Request, next: zono.App.Next) zono.Response, fn(req: zono.Request, next: zono.App.Next) !zono.Response, fn(c: *zono.Context, next: zono.Context.Next) zono.Response, or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response.");
+    @compileError("App.use middleware must be fn(c: *zono.Context, next: zono.Context.Next) zono.Response or fn(c: *zono.Context, next: zono.Context.Next) !zono.Response.");
 }
 
 fn resolveErrorHandler(target: anytype) ResolvedErrorHandler {
@@ -1103,9 +915,9 @@ fn resolveErrorHandler(target: anytype) ResolvedErrorHandler {
         .@"fn" => resolveErrorHandlerFn(target, TargetType),
         .pointer => |pointer| switch (@typeInfo(pointer.child)) {
             .@"fn" => resolveErrorHandlerFn(target, pointer.child),
-            else => @compileError("App.onError handlers must be fn(err: anyerror, req: zono.Request) zono.Response or fn(err: anyerror, c: *zono.Context) zono.Response."),
+            else => @compileError("App.onError handlers must be fn(err: anyerror, c: *zono.Context) zono.Response."),
         },
-        else => @compileError("App.onError handlers must be fn(err: anyerror, req: zono.Request) zono.Response or fn(err: anyerror, c: *zono.Context) zono.Response."),
+        else => @compileError("App.onError handlers must be fn(err: anyerror, c: *zono.Context) zono.Response."),
     };
 }
 
@@ -1122,18 +934,13 @@ fn resolveErrorHandlerFn(comptime target: anytype, comptime FnType: type) Resolv
     }
 
     const ParamType = info.params[1].type.?;
-    if (ParamType == Request) {
-        return .{
-            .handler = target,
-        };
-    }
     if (ParamType == *Context) {
         return .{
             .handler = wrapContextErrorResponder(target),
         };
     }
 
-    @compileError("App.onError handlers must be fn(err: anyerror, req: zono.Request) zono.Response or fn(err: anyerror, c: *zono.Context) zono.Response.");
+    @compileError("App.onError handlers must be fn(err: anyerror, c: *zono.Context) zono.Response.");
 }
 
 fn returnsErrorResponse(comptime return_type: ?type, comptime owner: []const u8) bool {
@@ -1163,18 +970,9 @@ fn wrapContextHandler(comptime target: anytype) Handler {
             const owns_context_state = ctx_req.context_state == null;
             if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
             defer if (owns_context_state) local_state.deinit();
-            attachSharedStateBindings(&ctx_req, if (owns_context_state) &local_state else @ptrCast(@alignCast(ctx_req.context_state.?)));
 
             var ctx = Context.init(ctx_req);
             return target(&ctx);
-        }
-    }.run;
-}
-
-fn wrapErrorHandler(comptime target: anytype) Handler {
-    return struct {
-        fn run(req: Request) Response {
-            return target(req) catch |err| dispatchHandlerError(req, err);
         }
     }.run;
 }
@@ -1187,7 +985,6 @@ fn wrapContextErrorHandler(comptime target: anytype) Handler {
             const owns_context_state = ctx_req.context_state == null;
             if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
             defer if (owns_context_state) local_state.deinit();
-            attachSharedStateBindings(&ctx_req, if (owns_context_state) &local_state else @ptrCast(@alignCast(ctx_req.context_state.?)));
 
             var ctx = Context.init(ctx_req);
             return target(&ctx) catch |err| dispatchHandlerError(ctx_req, err);
@@ -1195,15 +992,14 @@ fn wrapContextErrorHandler(comptime target: anytype) Handler {
     }.run;
 }
 
-fn wrapContextMiddleware(comptime target: anytype) App.Middleware {
+fn wrapContextMiddleware(comptime target: anytype) App.DispatchMiddleware {
     return struct {
-        fn run(req: Request, next: App.Next) Response {
+        fn run(req: Request, next: App.DispatchNext) Response {
             var local_state = context_mod.SharedState.init(req.allocator);
             var ctx_req = req;
             const owns_context_state = ctx_req.context_state == null;
             if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
             defer if (owns_context_state) local_state.deinit();
-            attachSharedStateBindings(&ctx_req, if (owns_context_state) &local_state else @ptrCast(@alignCast(ctx_req.context_state.?)));
 
             var ctx = Context.init(ctx_req);
             return target(&ctx, .{
@@ -1215,23 +1011,14 @@ fn wrapContextMiddleware(comptime target: anytype) App.Middleware {
     }.run;
 }
 
-fn wrapErrorMiddleware(comptime target: anytype) App.Middleware {
+fn wrapContextErrorMiddleware(comptime target: anytype) App.DispatchMiddleware {
     return struct {
-        fn run(req: Request, next: App.Next) Response {
-            return target(req, next) catch |err| dispatchHandlerError(req, err);
-        }
-    }.run;
-}
-
-fn wrapContextErrorMiddleware(comptime target: anytype) App.Middleware {
-    return struct {
-        fn run(req: Request, next: App.Next) Response {
+        fn run(req: Request, next: App.DispatchNext) Response {
             var local_state = context_mod.SharedState.init(req.allocator);
             var ctx_req = req;
             const owns_context_state = ctx_req.context_state == null;
             if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
             defer if (owns_context_state) local_state.deinit();
-            attachSharedStateBindings(&ctx_req, if (owns_context_state) &local_state else @ptrCast(@alignCast(ctx_req.context_state.?)));
 
             var ctx = Context.init(ctx_req);
             return target(&ctx, .{
@@ -1251,7 +1038,6 @@ fn wrapContextErrorResponder(comptime target: anytype) ErrorHandler {
             const owns_context_state = ctx_req.context_state == null;
             if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
             defer if (owns_context_state) local_state.deinit();
-            attachSharedStateBindings(&ctx_req, if (owns_context_state) &local_state else @ptrCast(@alignCast(ctx_req.context_state.?)));
 
             if (ctx_req.context_state) |raw_state| {
                 const state: *context_mod.SharedState = @ptrCast(@alignCast(raw_state));
@@ -1265,7 +1051,7 @@ fn wrapContextErrorResponder(comptime target: anytype) ErrorHandler {
 }
 
 fn runContextMiddlewareNext(next_ctx: *const anyopaque, req: Request) Response {
-    const next: *const App.Next = @ptrCast(@alignCast(next_ctx));
+    const next: *const App.DispatchNext = @ptrCast(@alignCast(next_ctx));
     return next.run(req);
 }
 
@@ -1273,49 +1059,12 @@ fn dispatchHandlerError(req: Request, err: anyerror) Response {
     if (req.context_state) |raw_state| {
         const state: *context_mod.SharedState = @ptrCast(@alignCast(raw_state));
         state.last_error = err;
-        if (err == error.HTTPException) {
-            if (state.on_error_handler) |handler| {
-                return handler(err, req);
-            }
-            if (state.http_exception) |*exception| {
-                return responseFromHttpException(req.allocator, exception.view()) catch response_mod.internalError("http exception response clone failed");
-            }
-        }
         if (state.on_error_handler) |handler| {
             return handler(err, req);
         }
     }
 
     return response_mod.text(.internal_server_error, "Internal Server Error");
-}
-
-fn responseFromHttpException(allocator: std.mem.Allocator, exception: http_exception_mod.HTTPException) std.mem.Allocator.Error!Response {
-    var borrowed = response_mod.body(exception.status, exception.content_type, exception.message);
-    for (exception.headers) |header| {
-        _ = borrowed.appendHeader(header.name, header.value);
-    }
-    defer borrowed.deinit();
-    return borrowed.clone(allocator) catch unreachable;
-}
-
-fn wrapRouteOnError(comptime route_error_handler: ErrorHandler, comptime inner_handler: Handler) Handler {
-    return struct {
-        fn run(req: Request) Response {
-            var local_state = context_mod.SharedState.init(req.allocator);
-            var handled_req = req;
-            const owns_context_state = handled_req.context_state == null;
-            if (owns_context_state) handled_req.context_state = @ptrCast(&local_state);
-            defer if (owns_context_state) local_state.deinit();
-            attachSharedStateBindings(&handled_req, if (owns_context_state) &local_state else @ptrCast(@alignCast(handled_req.context_state.?)));
-
-            const state: *context_mod.SharedState = @ptrCast(@alignCast(handled_req.context_state.?));
-            const previous_on_error_handler = state.on_error_handler;
-            state.on_error_handler = route_error_handler;
-            defer state.on_error_handler = previous_on_error_handler;
-
-            return inner_handler(handled_req);
-        }
-    }.run;
 }
 
 fn wrapRouteChain(comptime middlewares: anytype, comptime final_handler: Handler) Handler {
@@ -1463,8 +1212,8 @@ test "app dispatches through finalized router" {
     defer app.deinit();
 
     try app.get("/health", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            return c.text("ok");
         }
     }.run);
 
@@ -1480,8 +1229,8 @@ test "app redirects trailing slash misses" {
     defer arena.deinit();
 
     try app.get("/health", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            return c.text("ok");
         }
     }.run);
 
@@ -1497,8 +1246,8 @@ test "app automatically answers OPTIONS and 405" {
     defer arena.deinit();
 
     try app.get("/users", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            return c.text("ok");
         }
     }.run);
 
@@ -1511,23 +1260,6 @@ test "app automatically answers OPTIONS and 405" {
     try std.testing.expectEqualStrings("GET, OPTIONS", post_res.allow.?);
 }
 
-test "app redirects cleaned and case-corrected paths" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/Users/:id", struct {
-        fn run(req: Request) Response {
-            return response_mod.text(.ok, req.param("id") orelse "missing");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/..//users/42"));
-    try std.testing.expectEqual(std.http.Status.moved_permanently, res.status);
-    try std.testing.expectEqualStrings("/Users/42", res.location.?);
-}
-
 test "app strict false treats trailing slash variants as the same route" {
     var app = App.initWithOptions(std.testing.allocator, .{
         .strict = false,
@@ -1537,42 +1269,18 @@ test "app strict false treats trailing slash variants as the same route" {
     defer arena.deinit();
 
     try app.get("/health/", struct {
-        fn run(req: Request) Response {
-            return response_mod.text(.ok, req.path);
+        fn run(c: *Context) Response {
+            return c.text(c.req.path);
         }
     }.run);
 
     const no_slash_res = app.handle(Request.init(arena.allocator(), .GET, "/health"));
     try std.testing.expectEqual(std.http.Status.ok, no_slash_res.status);
     try std.testing.expectEqualStrings("/health", no_slash_res.body);
-    try std.testing.expect(no_slash_res.location == null);
 
     const slash_res = app.handle(Request.init(arena.allocator(), .GET, "/health/"));
     try std.testing.expectEqual(std.http.Status.ok, slash_res.status);
     try std.testing.expectEqualStrings("/health/", slash_res.body);
-    try std.testing.expect(slash_res.location == null);
-}
-
-test "app options can disable automatic options and 405 handling" {
-    var app = App.initWithOptions(std.testing.allocator, .{
-        .handle_options = false,
-        .handle_method_not_allowed = false,
-    });
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/users", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "users");
-        }
-    }.run);
-
-    const options_res = app.handle(Request.init(arena.allocator(), .OPTIONS, "/users"));
-    try std.testing.expectEqual(std.http.Status.not_found, options_res.status);
-
-    const post_res = app.handle(Request.init(arena.allocator(), .POST, "/users"));
-    try std.testing.expectEqual(std.http.Status.not_found, post_res.status);
 }
 
 test "app basePath and route compose prefixed sub-apps" {
@@ -1585,13 +1293,13 @@ test "app basePath and route compose prefixed sub-apps" {
 
     try app.basePath("/api/");
     try users.get("/", struct {
-        fn list(_: Request) Response {
-            return response_mod.text(.ok, "users");
+        fn list(c: *Context) Response {
+            return c.text("users");
         }
     }.list);
     try users.get("/:id", struct {
-        fn detail(req: Request) Response {
-            return response_mod.text(.ok, req.param("id") orelse "missing");
+        fn detail(c: *Context) Response {
+            return c.text(c.req.param("id") orelse "missing");
         }
     }.detail);
     try app.route("/users/", &users);
@@ -1603,28 +1311,6 @@ test "app basePath and route compose prefixed sub-apps" {
     try std.testing.expectEqualStrings("42", detail_res.body);
 }
 
-test "app routes expose aggregated params views" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/users/:id/posts/:slug", struct {
-        fn run(req: Request) Response {
-            var params = req.parseParams(.{}) catch return response_mod.internalError("params parse failed");
-            defer params.deinit();
-
-            const slug = params.value("slug") orelse "missing";
-            const body = req.allocator.dupe(u8, slug) catch return response_mod.internalError("params alloc failed");
-            return response_mod.text(.ok, body);
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/users/42/posts/hello-zig"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("hello-zig", res.body);
-}
-
 test "app use wraps downstream responses" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -1632,15 +1318,15 @@ test "app use wraps downstream responses" {
     defer arena.deinit();
 
     try app.use(struct {
-        fn run(req: Request, next: App.Next) Response {
-            var res = next.run(req);
-            _ = res.header("x-middleware", "yes");
-            return res;
+        fn run(c: *Context, next: Context.Next) Response {
+            next.run();
+            _ = c.header("x-middleware", "yes");
+            return c.takeResponse();
         }
     }.run);
     try app.get("/health", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            return c.text("ok");
         }
     }.run);
 
@@ -1656,21 +1342,22 @@ test "app useAt applies middleware to matching prefixes only" {
     defer arena.deinit();
 
     try app.useAt("/admin", struct {
-        fn run(req: Request, next: App.Next) Response {
-            if (!std.mem.eql(u8, req.header("x-admin") orelse "", "1")) {
-                return response_mod.text(.unauthorized, "denied");
+        fn run(c: *Context, next: Context.Next) Response {
+            if (!std.mem.eql(u8, c.req.header("x-admin") orelse "", "1")) {
+                return c.textWithStatus(.unauthorized, "denied");
             }
-            return next.run(req);
+            next.run();
+            return c.takeResponse();
         }
     }.run);
     try app.get("/admin/panel", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "secret");
+        fn run(c: *Context) Response {
+            return c.text("secret");
         }
     }.run);
     try app.get("/health", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            return c.text("ok");
         }
     }.run);
 
@@ -1681,81 +1368,6 @@ test "app useAt applies middleware to matching prefixes only" {
     const public = app.handle(Request.init(arena.allocator(), .GET, "/health"));
     try std.testing.expectEqual(std.http.Status.ok, public.status);
     try std.testing.expectEqualStrings("ok", public.body);
-}
-
-test "app route carries sub-app middleware" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var child = App.init(std.testing.allocator);
-    defer child.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try child.use(struct {
-        fn run(req: Request, next: App.Next) Response {
-            var res = next.run(req);
-            _ = res.header("x-child", req.path);
-            return res;
-        }
-    }.run);
-    try child.get("/hello", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "hello");
-        }
-    }.run);
-    try app.route("/api", &child);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/api/hello"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("hello", res.body);
-    try std.testing.expectEqualStrings("/api/hello", responseHeaderValue(res, "x-child").?);
-}
-
-test "app context handlers can build responses" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/ctx", struct {
-        fn run(c: *Context) Response {
-            c.status(.created);
-            _ = c.header("x-handler", "context");
-            return c.text("hello");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
-    try std.testing.expectEqual(std.http.Status.created, res.status);
-    try std.testing.expectEqualStrings("hello", res.body);
-    try std.testing.expectEqualStrings("context", responseHeaderValue(res, "x-handler").?);
-}
-
-test "app context middleware preserves pre-next headers" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.use(struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            _ = c.header("x-before", "1");
-            next.run();
-            _ = c.res.header("x-after", "1");
-            return c.takeResponse();
-        }
-    }.run);
-    try app.get("/ctx", struct {
-        fn run(c: *Context) Response {
-            return c.text("ok");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("ok", res.body);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-before").?);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-after").?);
 }
 
 test "app context middleware can set values for context handlers" {
@@ -1784,103 +1396,6 @@ test "app context middleware can set values for context handlers" {
     const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx"));
     try std.testing.expectEqual(std.http.Status.accepted, res.status);
     try std.testing.expectEqualStrings("hello from context", res.body);
-}
-
-test "app context json serializes zig values" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/ctx-json", struct {
-        fn run(c: *Context) Response {
-            c.status(.accepted);
-            return c.json(.{
-                .ok = true,
-                .framework = "zono",
-            });
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-json"));
-    try std.testing.expectEqual(std.http.Status.accepted, res.status);
-    try std.testing.expectEqualStrings("application/json; charset=utf-8", res.content_type);
-    try std.testing.expectEqualStrings("{\"ok\":true,\"framework\":\"zono\"}", res.body);
-}
-
-test "app context vars exposes request scoped values" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.use(struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            c.set("message", "hello from var") catch return response_mod.internalError("set failed");
-            next.run();
-            return c.takeResponse();
-        }
-    }.run);
-    try app.get("/ctx-var", struct {
-        fn run(c: *Context) Response {
-            if (!c.vars.contains("message")) return response_mod.internalError("missing message");
-            const message = c.vars.get([]const u8, "message") orelse return response_mod.internalError("missing typed message");
-            return c.text(message);
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-var"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("hello from var", res.body);
-}
-
-test "app context notFound uses custom app notFound handler" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    app.notFound(struct {
-        fn run(req: Request) Response {
-            return response_mod.text(.not_found, req.path);
-        }
-    }.run);
-    try app.get("/ctx-miss", struct {
-        fn run(c: *Context) Response {
-            _ = c.header("x-before", "1");
-            return c.notFound();
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-miss"));
-    try std.testing.expectEqual(std.http.Status.not_found, res.status);
-    try std.testing.expectEqualStrings("/ctx-miss", res.body);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-before").?);
-}
-
-test "app onError handles request handler errors" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    app.onError(struct {
-        fn run(err: anyerror, req: Request) Response {
-            if (err == error.Boom) {
-                return response_mod.text(.bad_request, req.path);
-            }
-            return response_mod.text(.internal_server_error, "unexpected");
-        }
-    }.run);
-    try app.get("/boom", struct {
-        fn run(_: Request) !Response {
-            return error.Boom;
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/boom"));
-    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
-    try std.testing.expectEqualStrings("/boom", res.body);
 }
 
 test "app onError handles context handler errors" {
@@ -1932,7 +1447,7 @@ test "app context middleware can inspect c.err after next.run" {
         }
     }.run);
     try app.get("/ctx-error", struct {
-        fn run(_: Request) !Response {
+        fn run(_: *Context) !Response {
             return error.Boom;
         }
     }.run);
@@ -1941,33 +1456,6 @@ test "app context middleware can inspect c.err after next.run" {
     try std.testing.expectEqual(std.http.Status.bad_request, res.status);
     try std.testing.expectEqualStrings("Boom", res.body);
     try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-error-seen").?);
-}
-
-test "app route tuples support route-level middleware" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/tuple", .{
-        struct {
-            fn run(req: Request, next: App.Next) Response {
-                var res = next.run(req);
-                _ = res.header("x-route", req.path);
-                return res;
-            }
-        }.run,
-        struct {
-            fn run(_: Request) Response {
-                return response_mod.text(.ok, "tuple");
-            }
-        }.run,
-    });
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/tuple"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("tuple", res.body);
-    try std.testing.expectEqualStrings("/tuple", responseHeaderValue(res, "x-route").?);
 }
 
 test "app route tuples support context middleware and handlers" {
@@ -1998,426 +1486,6 @@ test "app route tuples support context middleware and handlers" {
     try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-context-route").?);
 }
 
-test "app route tuples work with onError and c.err" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    app.onError(struct {
-        fn run(err: anyerror, c: *Context) Response {
-            c.status(.bad_request);
-            return c.text(@errorName(err));
-        }
-    }.run);
-    try app.get("/tuple-error", .{
-        struct {
-            fn run(c: *Context, next: Context.Next) Response {
-                next.run();
-                if (c.err != null) {
-                    _ = c.header("x-route-error", "1");
-                }
-                return c.takeResponse();
-            }
-        }.run,
-        struct {
-            fn run(_: Request) !Response {
-                return error.TupleBoom;
-            }
-        }.run,
-    });
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/tuple-error"));
-    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
-    try std.testing.expectEqualStrings("TupleBoom", res.body);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-error").?);
-}
-
-test "app routeOnError overrides app onError for a single route" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    app.onError(struct {
-        fn run(_: anyerror, _: Request) Response {
-            return response_mod.text(.internal_server_error, "app");
-        }
-    }.run);
-    try app.get("/route-error", .{
-        routeOnError(struct {
-            fn run(err: anyerror, c: *Context) Response {
-                return c.textWithStatus(if (err == error.RouteBoom) .unprocessable_entity else .internal_server_error, @errorName(err));
-            }
-        }.run),
-        struct {
-            fn run(_: Request) !Response {
-                return error.RouteBoom;
-            }
-        }.run,
-    });
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/route-error"));
-    try std.testing.expectEqual(std.http.Status.unprocessable_entity, res.status);
-    try std.testing.expectEqualStrings("RouteBoom", res.body);
-}
-
-test "app routeOnError works with route middleware and context sugar" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/route-error-ctx", .{
-        routeOnError(struct {
-            fn run(err: anyerror, c: *Context) Response {
-                const Payload = struct {
-                    @"error": []const u8,
-                };
-                _ = c.header("x-route-level", "1");
-                const status_code: std.http.Status = if (err == error.RouteCtxBoom) .bad_request else .internal_server_error;
-                const payload: Payload = .{
-                    .@"error" = @errorName(err),
-                };
-                return c.jsonWithStatus(status_code, payload);
-            }
-        }.run),
-        struct {
-            fn run(c: *Context, next: Context.Next) Response {
-                next.run();
-                if (c.err != null) {
-                    _ = c.header("x-route-error", "1");
-                }
-                return c.takeResponse();
-            }
-        }.run,
-        struct {
-            fn run(_: Request) !Response {
-                return error.RouteCtxBoom;
-            }
-        }.run,
-    });
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/route-error-ctx"));
-    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
-    try std.testing.expectEqualStrings("{\"error\":\"RouteCtxBoom\"}", res.body);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-level").?);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-error").?);
-}
-
-test "app context sugar can set status inline" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.get("/ctx-sugar", struct {
-        fn run(c: *Context) Response {
-            return c.textWithStatus(.created, "created");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-sugar"));
-    try std.testing.expectEqual(std.http.Status.created, res.status);
-    try std.testing.expectEqualStrings("created", res.body);
-}
-
-test "app request options expose env executionCtx event and raw through context" {
-    const RawValue = struct { code: u32 };
-    const EnvValue = struct { name: []const u8 };
-    const EventValue = struct { id: u32 };
-    const ExecValue = struct { ready: bool };
-
-    const raw_value = RawValue{ .code = 7 };
-    const env_value = EnvValue{ .name = "prod" };
-    const event_value = EventValue{ .id = 42 };
-    const exec_value = ExecValue{ .ready = true };
-
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-
-    try app.get("/platform", struct {
-        fn run(c: *Context) Response {
-            const payload = struct {
-                env: []const u8,
-                event: u32,
-                raw: u32,
-                ready: bool,
-            }{
-                .env = c.envAs(EnvValue).?.name,
-                .event = c.eventAs(EventValue).?.id,
-                .raw = c.rawAs(RawValue).?.code,
-                .ready = c.executionCtxAs(ExecValue).?.ready,
-            };
-            return c.json(payload);
-        }
-    }.run);
-
-    var res = try app.request(std.testing.allocator, "/platform", .{
-        .raw = @ptrCast(&raw_value),
-        .env = @ptrCast(&env_value),
-        .event = @ptrCast(&event_value),
-        .executionCtx = @ptrCast(&exec_value),
-    });
-    defer res.deinit();
-
-    try std.testing.expectEqualStrings("{\"env\":\"prod\",\"event\":42,\"raw\":7,\"ready\":true}", res.body);
-}
-
-test "app context renderer wraps downstream content" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.use(struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            c.setRenderer(struct {
-                fn render(ctx: *Context, content: []const u8) Response {
-                    const wrapped = std.fmt.allocPrint(ctx.req.allocator, "<main>{s}</main>", .{content}) catch {
-                        return response_mod.internalError("alloc failed");
-                    };
-                    _ = ctx.header("x-renderer", "context");
-                    return ctx.html(wrapped);
-                }
-            }.render);
-            next.run();
-            return c.takeResponse();
-        }
-    }.run);
-    try app.get("/render", struct {
-        fn run(c: *Context) Response {
-            return c.render("hello");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/render"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("<main>hello</main>", res.body);
-    try std.testing.expectEqualStrings("context", responseHeaderValue(res, "x-renderer").?);
-}
-
-test "app plain renderer functions are supported" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.use(struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            c.setRenderer(struct {
-                fn render(content: []const u8) Response {
-                    return response_mod.html(content);
-                }
-            }.render);
-            next.run();
-            return c.takeResponse();
-        }
-    }.run);
-    try app.get("/render-plain", struct {
-        fn run(c: *Context) Response {
-            return c.render("<strong>ok</strong>");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/render-plain"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("<strong>ok</strong>", res.body);
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", res.content_type);
-}
-
-test "app validated values flow from context middleware into request handlers" {
-    const Claims = struct {
-        user_id: u32,
-    };
-
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.use(struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            c.setValid(.json, Claims{
-                .user_id = 42,
-            }) catch return response_mod.internalError("valid failed");
-            next.run();
-            return c.takeResponse();
-        }
-    }.run);
-    try app.get("/valid-request", struct {
-        fn run(req: Request) Response {
-            const claims = req.valid(Claims, .json) orelse return response_mod.internalError("missing claims");
-            return response_mod.text(.ok, if (claims.user_id == 42) "ok" else "bad");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/valid-request"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("ok", res.body);
-}
-
-test "app validated values flow into context handlers" {
-    const QueryValue = struct {
-        page: u32,
-    };
-
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.use(struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            c.setValid(.query, QueryValue{
-                .page = 3,
-            }) catch return response_mod.internalError("valid failed");
-            next.run();
-            return c.takeResponse();
-        }
-    }.run);
-    try app.get("/valid-context", struct {
-        fn run(c: *Context) Response {
-            const query = c.valid(QueryValue, .query) orelse return response_mod.internalError("missing query");
-            return c.textWithStatus(.ok, if (query.page == 3) "page-3" else "bad");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/valid-context"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("page-3", res.body);
-}
-
-test "app route helpers expose route metadata after middleware next" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.basePath("/api");
-    try app.useAt("/posts", struct {
-        fn run(c: *Context, next: Context.Next) Response {
-            next.run();
-
-            const matched = c.matchedRoutes();
-            const route_path = route_helper_mod.routePath(c) orelse return response_mod.internalError("missing route path");
-            const base_route_path = route_helper_mod.baseRoutePath(c) orelse return response_mod.internalError("missing base route path");
-            const middleware_path = if (matched.len > 0) matched[0].path else "missing";
-            const route_path_match = if (matched.len > 1) matched[1].path else "missing";
-            const middleware_kind = if (matched.len > 0 and matched[0].kind == .middleware) "middleware" else "missing";
-            const route_kind = if (matched.len > 1 and matched[1].kind == .route) "route" else "missing";
-            const body_text = std.fmt.allocPrint(c.req.allocator, "{s}|{s}|{d}|{s}|{s}|{s}|{s}", .{
-                route_path,
-                base_route_path,
-                matched.len,
-                middleware_kind,
-                middleware_path,
-                route_kind,
-                route_path_match,
-            }) catch return response_mod.internalError("alloc failed");
-            return c.text(body_text);
-        }
-    }.run);
-    try app.get("/posts/:id", struct {
-        fn run(c: *Context) Response {
-            return c.text("ignored");
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/api/posts/42"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("/api/posts/:id|/api|2|middleware|/api/posts|route|/api/posts/:id", res.body);
-}
-
-test "app validator helper populates valid data and surfaces parser errors" {
-    const Query = struct {
-        page: u32,
-    };
-
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    app.onError(struct {
-        fn run(err: anyerror, c: *Context) Response {
-            if (err == error.MissingPage or err == error.InvalidPage) {
-                return c.textWithStatus(.bad_request, @errorName(err));
-            }
-            return c.textWithStatus(.internal_server_error, @errorName(err));
-        }
-    }.run);
-    try app.use(validator_mod.validator(.query, struct {
-        fn run(req: Request) !Query {
-            var query = try req.parseQuery(.{});
-            defer query.deinit();
-
-            const raw_page = query.value("page") orelse return error.MissingPage;
-            return .{
-                .page = std.fmt.parseInt(u32, raw_page, 10) catch return error.InvalidPage,
-            };
-        }
-    }.run));
-    try app.get("/search", struct {
-        fn run(req: Request) Response {
-            const query = req.valid(Query, .query) orelse return response_mod.internalError("missing validated query");
-            return response_mod.text(.ok, if (query.page == 7) "page-7" else "bad");
-        }
-    }.run);
-
-    var ok_req = Request.init(arena.allocator(), .GET, "/search");
-    ok_req.query_string = "page=7";
-    const ok_res = app.handle(ok_req);
-    try std.testing.expectEqual(std.http.Status.ok, ok_res.status);
-    try std.testing.expectEqualStrings("page-7", ok_res.body);
-
-    const missing_res = app.handle(Request.init(arena.allocator(), .GET, "/search"));
-    try std.testing.expectEqual(std.http.Status.bad_request, missing_res.status);
-    try std.testing.expectEqualStrings("MissingPage", missing_res.body);
-}
-
-test "app http exception defaults and onError both see stored exception data" {
-    var default_app = App.init(std.testing.allocator);
-    defer default_app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try default_app.get("/default-http-exception", struct {
-        fn run(c: *Context) !Response {
-            return c.throw(http_exception_mod.HTTPException.init(.gone, "gone").withHeaders(&.{
-                .{ .name = "x-http-exception", .value = "1" },
-            }));
-        }
-    }.run);
-
-    const default_res = default_app.handle(Request.init(arena.allocator(), .GET, "/default-http-exception"));
-    try std.testing.expectEqual(std.http.Status.gone, default_res.status);
-    try std.testing.expectEqualStrings("gone", default_res.body);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(default_res, "x-http-exception").?);
-
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    app.onError(struct {
-        fn run(err: anyerror, c: *Context) Response {
-            if (err != error.HTTPException) return c.textWithStatus(.internal_server_error, @errorName(err));
-
-            const exception = c.httpException() orelse return c.textWithStatus(.internal_server_error, "missing exception");
-            _ = c.header("x-http-caught", "1");
-            return c.textWithStatus(exception.status, exception.message);
-        }
-    }.run);
-    try app.get("/caught-http-exception", struct {
-        fn run(req: Request) !Response {
-            return req.throw(http_exception_mod.HTTPException.init(.unprocessable_entity, "bad input"));
-        }
-    }.run);
-
-    const caught_res = app.handle(Request.init(arena.allocator(), .GET, "/caught-http-exception"));
-    try std.testing.expectEqual(std.http.Status.unprocessable_entity, caught_res.status);
-    try std.testing.expectEqualStrings("bad input", caught_res.body);
-    try std.testing.expectEqualStrings("1", responseHeaderValue(caught_res, "x-http-caught").?);
-}
-
 test "app mount delegates prefixed requests to mounted apps" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -2427,13 +1495,13 @@ test "app mount delegates prefixed requests to mounted apps" {
     defer arena.deinit();
 
     try mounted.get("/", struct {
-        fn root(_: Request) Response {
-            return response_mod.text(.ok, "mounted root");
+        fn root(c: *Context) Response {
+            return c.text("mounted root");
         }
     }.root);
     try mounted.get("/hello", struct {
-        fn hello(_: Request) Response {
-            return response_mod.text(.ok, "mounted hello");
+        fn hello(c: *Context) Response {
+            return c.text("mounted hello");
         }
     }.hello);
     try app.mount("/nested", &mounted);
@@ -2447,28 +1515,6 @@ test "app mount delegates prefixed requests to mounted apps" {
     try std.testing.expectEqualStrings("mounted hello", hello_res.body);
 }
 
-test "app mount prefers the longest matching prefix" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    try app.mount("/api", struct {
-        fn api(req: Request) Response {
-            return response_mod.text(.ok, req.path);
-        }
-    }.api);
-    try app.mount("/api/admin", struct {
-        fn admin(req: Request) Response {
-            return response_mod.text(.ok, req.path);
-        }
-    }.admin);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/api/admin/users"));
-    try std.testing.expectEqual(std.http.Status.ok, res.status);
-    try std.testing.expectEqualStrings("/users", res.body);
-}
-
 test "app on registers multiple methods and paths" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -2476,8 +1522,8 @@ test "app on registers multiple methods and paths" {
     defer arena.deinit();
 
     try app.on(.{ .PUT, .DELETE }, .{ "/posts", "/authors" }, struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "multi");
+        fn run(c: *Context) Response {
+            return c.text("multi");
         }
     }.run);
 
@@ -2494,8 +1540,8 @@ test "app all registers all common methods" {
     defer arena.deinit();
 
     try app.all("/echo", struct {
-        fn run(req: Request) Response {
-            return response_mod.text(.ok, @tagName(req.method));
+        fn run(c: *Context) Response {
+            return c.text(@tagName(c.req.method));
         }
     }.run);
 
@@ -2504,23 +1550,6 @@ test "app all registers all common methods" {
 
     try std.testing.expectEqualStrings("GET", get_res.body);
     try std.testing.expectEqualStrings("TRACE", trace_res.body);
-}
-
-test "app custom notFound handler overrides default miss response" {
-    var app = App.init(std.testing.allocator);
-    defer app.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    app.notFound(struct {
-        fn run(req: Request) Response {
-            return response_mod.text(.not_found, req.path);
-        }
-    }.run);
-
-    const res = app.handle(Request.init(arena.allocator(), .GET, "/missing"));
-    try std.testing.expectEqual(std.http.Status.not_found, res.status);
-    try std.testing.expectEqualStrings("/missing", res.body);
 }
 
 test "app custom notFound handler accepts context handlers" {
@@ -2548,11 +1577,11 @@ test "app request helper dispatches with query headers and body" {
     defer app.deinit();
 
     try app.post("/search", struct {
-        fn run(req: Request) Response {
-            if (!std.mem.eql(u8, req.query("q") orelse "", "zig")) return response_mod.text(.bad_request, "bad query");
-            if (!std.mem.eql(u8, req.header("x-mode") orelse "", "test")) return response_mod.text(.bad_request, "bad header");
-            if (!std.mem.eql(u8, req.text(), "payload")) return response_mod.text(.bad_request, "bad body");
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            if (!std.mem.eql(u8, c.req.query("q") orelse "", "zig")) return c.textWithStatus(.bad_request, "bad query");
+            if (!std.mem.eql(u8, c.req.header("x-mode") orelse "", "test")) return c.textWithStatus(.bad_request, "bad header");
+            if (!std.mem.eql(u8, c.req.text(), "payload")) return c.textWithStatus(.bad_request, "bad body");
+            return c.text("ok");
         }
     }.run);
 
@@ -2572,8 +1601,8 @@ test "app request helper accepts absolute urls" {
     defer app.deinit();
 
     try app.get("/hello", struct {
-        fn run(req: Request) Response {
-            return response_mod.text(.ok, req.query("name") orelse "missing");
+        fn run(c: *Context) Response {
+            return c.text(c.req.query("name") orelse "missing");
         }
     }.run);
 
@@ -2589,9 +1618,9 @@ test "app request helper accepts zono request values" {
     defer app.deinit();
 
     try app.post("/submit", struct {
-        fn run(req: Request) Response {
-            if (!std.mem.eql(u8, req.query("draft") orelse "", "1")) return response_mod.text(.bad_request, "bad query");
-            return response_mod.text(.created, req.text());
+        fn run(c: *Context) Response {
+            if (!std.mem.eql(u8, c.req.query("draft") orelse "", "1")) return c.textWithStatus(.bad_request, "bad query");
+            return c.textWithStatus(.created, c.req.text());
         }
     }.run);
 
@@ -2606,43 +1635,26 @@ test "app request helper accepts zono request values" {
     try std.testing.expectEqualStrings("payload", res.body);
 }
 
-test "app fetchRaw adapts target raw env executionCtx and event" {
-    const RawValue = struct { code: u32 };
-    const EnvValue = struct { name: []const u8 };
-    const EventValue = struct { id: u32 };
-    const ExecValue = struct { ready: bool };
-
-    const raw_value = RawValue{ .code = 9 };
-    const env_value = EnvValue{ .name = "edge" };
-    const event_value = EventValue{ .id = 88 };
-    const exec_value = ExecValue{ .ready = true };
-
+test "app request helper rejects websocket upgrade responses" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.get("/fetch-raw", struct {
+    try app.get("/ws", struct {
         fn run(c: *Context) Response {
-            return c.json(.{
-                .mode = c.req.query("mode") orelse "",
-                .env = c.envAs(EnvValue).?.name,
-                .event = c.eventAs(EventValue).?.id,
-                .raw = c.rawAs(RawValue).?.code,
-                .ready = c.executionCtxAs(ExecValue).?.ready,
-            });
+            return c.upgradeWebSocket(struct {
+                fn socket(_: *response_mod.WebSocketConnection) !void {}
+            }.socket, .{});
         }
     }.run);
 
-    var res = try app.fetchRaw(std.testing.allocator, .{
-        .target = "https://example.com/fetch-raw?mode=edge",
-        .raw = @ptrCast(&raw_value),
-    }, .{
-        .env = @ptrCast(&env_value),
-        .event = @ptrCast(&event_value),
-        .executionCtx = @ptrCast(&exec_value),
-    });
-    defer res.deinit();
-
-    try std.testing.expectEqualStrings("{\"mode\":\"edge\",\"env\":\"edge\",\"event\":88,\"raw\":9,\"ready\":true}", res.body);
+    try std.testing.expectError(error.UnsupportedRuntimeClone, app.request(std.testing.allocator, "/ws", .{
+        .headers = &.{
+            .{ .name = "upgrade", .value = "websocket" },
+            .{ .name = "connection", .value = "Upgrade" },
+            .{ .name = "sec-websocket-key", .value = "dGhlIHNhbXBsZSBub25jZQ==" },
+            .{ .name = "sec-websocket-version", .value = "13" },
+        },
+    }));
 }
 
 test "app showRoutes lists middleware mounts and routes" {
@@ -2650,18 +1662,19 @@ test "app showRoutes lists middleware mounts and routes" {
     defer app.deinit();
 
     try app.useAt("/api", struct {
-        fn run(req: Request, next: App.Next) Response {
-            return next.run(req);
+        fn run(c: *Context, next: Context.Next) Response {
+            next.run();
+            return c.takeResponse();
         }
     }.run);
     try app.mount("/legacy", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "legacy");
+        fn run(c: *Context) Response {
+            return c.text("legacy");
         }
     }.run);
     try app.get("/posts/:id", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "post");
+        fn run(c: *Context) Response {
+            return c.text("post");
         }
     }.run);
 
@@ -2678,8 +1691,8 @@ test "app fetch aliases handle" {
     defer app.deinit();
 
     try app.get("/health", struct {
-        fn run(_: Request) Response {
-            return response_mod.text(.ok, "ok");
+        fn run(c: *Context) Response {
+            return c.text("ok");
         }
     }.run);
 

@@ -1,5 +1,4 @@
 const std = @import("std");
-const HTTPException = @import("http_exception.zig").HTTPException;
 
 pub const Param = struct {
     key: []const u8,
@@ -9,12 +8,6 @@ pub const Param = struct {
 pub const Header = std.http.Header;
 const HeaderLookupFn = *const fn (ctx: *const anyopaque, name: []const u8) ?[]const u8;
 const HeadersCollectFn = *const fn (ctx: *const anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const Header;
-const ValidationLookupFn = *const fn (ctx: *const anyopaque, target: ValidationTarget, type_name: []const u8) ?*const anyopaque;
-const RoutePathLookupFn = *const fn (ctx: *const anyopaque) ?[]const u8;
-const BaseRoutePathLookupFn = *const fn (ctx: *const anyopaque) ?[]const u8;
-const MatchedRoutesLookupFn = *const fn (ctx: *const anyopaque) []const MatchedRoute;
-const HttpExceptionStoreFn = *const fn (ctx: *const anyopaque, exception: HTTPException) std.mem.Allocator.Error!void;
-const HttpExceptionLoadFn = *const fn (ctx: *const anyopaque) ?HTTPException;
 pub const FormError = std.mem.Allocator.Error || error{
     InvalidPercentEncoding,
 };
@@ -22,32 +15,6 @@ pub const ParseBodyError = FormError || error{
     UnsupportedContentType,
     MissingMultipartBoundary,
     InvalidMultipartBody,
-    UnsupportedMultipartFile,
-};
-
-pub const ValidationTarget = enum {
-    form,
-    json,
-    query,
-    header,
-    cookie,
-    param,
-};
-
-pub const MatchedRouteKind = enum {
-    middleware,
-    route,
-    mount,
-};
-
-pub const MatchedRoute = struct {
-    path: []const u8,
-    kind: MatchedRouteKind,
-};
-
-pub const RequestBlob = struct {
-    bytes: []const u8,
-    content_type: ?[]const u8 = null,
 };
 
 pub const ParseBodyOptions = struct {
@@ -330,27 +297,11 @@ pub const Request = struct {
     path: []const u8,
     query_string: []const u8 = "",
     body: []const u8 = "",
-    raw: ?*const anyopaque = null,
-    env: ?*const anyopaque = null,
-    executionCtx: ?*const anyopaque = null,
-    event: ?*const anyopaque = null,
     cookies_raw: []const u8 = "",
     header_list: []const Header = &.{},
     header_lookup_ctx: ?*const anyopaque = null,
     header_lookup_fn: ?HeaderLookupFn = null,
     headers_collect_fn: ?HeadersCollectFn = null,
-    validation_lookup_ctx: ?*const anyopaque = null,
-    validation_lookup_fn: ?ValidationLookupFn = null,
-    route_path_value: ?[]const u8 = null,
-    base_route_path_value: ?[]const u8 = null,
-    matched_route_list: []const MatchedRoute = &.{},
-    route_lookup_ctx: ?*const anyopaque = null,
-    route_path_lookup_fn: ?RoutePathLookupFn = null,
-    base_route_path_lookup_fn: ?BaseRoutePathLookupFn = null,
-    matched_routes_lookup_fn: ?MatchedRoutesLookupFn = null,
-    http_exception_ctx: ?*const anyopaque = null,
-    http_exception_store_fn: ?HttpExceptionStoreFn = null,
-    http_exception_load_fn: ?HttpExceptionLoadFn = null,
     params: []const Param = &.{},
     context_state: ?*anyopaque = null,
 
@@ -364,63 +315,6 @@ pub const Request = struct {
 
     pub fn contextState(self: Request) ?*anyopaque {
         return self.context_state;
-    }
-
-    pub fn rawAs(self: Request, comptime T: type) ?*const T {
-        return castOpaquePtr(T, self.raw);
-    }
-
-    pub fn envAs(self: Request, comptime T: type) ?*const T {
-        return castOpaquePtr(T, self.env);
-    }
-
-    pub fn executionCtxAs(self: Request, comptime T: type) ?*const T {
-        return castOpaquePtr(T, self.executionCtx);
-    }
-
-    pub fn eventAs(self: Request, comptime T: type) ?*const T {
-        return castOpaquePtr(T, self.event);
-    }
-
-    pub fn valid(self: Request, comptime T: type, comptime target: ValidationTarget) ?T {
-        const lookup = self.validation_lookup_fn orelse return null;
-        const ctx = self.validation_lookup_ctx orelse return null;
-        const value_ptr = lookup(ctx, target, @typeName(T)) orelse return null;
-        const typed_value: *const T = @ptrCast(@alignCast(value_ptr));
-        return typed_value.*;
-    }
-
-    pub fn routePath(self: Request) ?[]const u8 {
-        const lookup = self.route_path_lookup_fn orelse return self.route_path_value;
-        const ctx = self.route_lookup_ctx orelse return self.route_path_value;
-        return lookup(ctx) orelse self.route_path_value;
-    }
-
-    pub fn baseRoutePath(self: Request) ?[]const u8 {
-        const lookup = self.base_route_path_lookup_fn orelse return self.base_route_path_value;
-        const ctx = self.route_lookup_ctx orelse return self.base_route_path_value;
-        return lookup(ctx) orelse self.base_route_path_value;
-    }
-
-    pub fn matchedRoutes(self: Request) []const MatchedRoute {
-        const lookup = self.matched_routes_lookup_fn orelse return self.matched_route_list;
-        const ctx = self.route_lookup_ctx orelse return self.matched_route_list;
-        return lookup(ctx);
-    }
-
-    pub fn httpException(self: Request) ?HTTPException {
-        const lookup = self.http_exception_load_fn orelse return null;
-        const ctx = self.http_exception_ctx orelse return null;
-        return lookup(ctx);
-    }
-
-    pub fn throw(self: Request, exception: @import("http_exception.zig").ThrowErrorValue) @import("http_exception.zig").ThrowError {
-        if (self.http_exception_store_fn) |store| {
-            if (self.http_exception_ctx) |ctx| {
-                store(ctx, exception) catch return error.OutOfMemory;
-            }
-        }
-        return error.HTTPException;
     }
 
     pub fn param(self: Request, name_or_mode: anytype) ParamResultType(@TypeOf(name_or_mode)) {
@@ -688,27 +582,15 @@ pub const Request = struct {
         return self.body;
     }
 
-    pub fn arrayBuffer(self: Request) []const u8 {
-        return self.body;
-    }
-
-    pub fn blob(self: Request) RequestBlob {
-        return .{
-            .bytes = self.body,
-            .content_type = self.contentType(),
-        };
-    }
-
     pub fn json(self: Request, comptime T: type) !?std.json.Parsed(T) {
         if (self.body.len == 0) return null;
+        if (self.header("content-type")) |raw_content_type| {
+            if (!isJsonContentTypeValue(raw_content_type)) {
+                return error.UnsupportedContentType;
+            }
+        }
         return try std.json.parseFromSlice(T, self.allocator, self.body, .{
             .ignore_unknown_fields = true,
-        });
-    }
-
-    pub fn formData(self: Request) ParseBodyError!ParsedFormData {
-        return try self.parseBody(.{
-            .all = true,
         });
     }
 
@@ -727,64 +609,6 @@ pub const Request = struct {
         } else {
             return error.UnsupportedContentType;
         }
-    }
-
-    pub fn parseMultipart(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedFormData {
-        if (self.body.len == 0) {
-            var parsed = ParsedFormData.init(self.allocator);
-            parsed.fields.dot = body_options.dot;
-            return parsed;
-        }
-        if (!self.hasContentType("multipart/form-data")) {
-            return error.UnsupportedContentType;
-        }
-
-        const raw_content_type = self.header("content-type") orelse return error.MissingMultipartBoundary;
-        return try parseMultipartForm(self.allocator, raw_content_type, self.body, body_options);
-    }
-
-    pub fn formValue(self: Request, name: []const u8) FormError!?[]const u8 {
-        if (!self.hasContentType("application/x-www-form-urlencoded") or self.body.len == 0) return null;
-
-        var rest = self.body;
-        while (rest.len > 0) {
-            const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
-            const pair = rest[0..amp];
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-            const key_raw = pair[0..eq];
-            const value_raw = if (eq < pair.len) pair[eq + 1 ..] else "";
-            const decoded_key = try decodeFormComponent(self.allocator, key_raw);
-            if (std.mem.eql(u8, decoded_key, name)) {
-                return try decodeFormComponent(self.allocator, value_raw);
-            }
-            rest = if (amp < rest.len) rest[amp + 1 ..] else "";
-        }
-
-        return null;
-    }
-
-    pub fn formValues(self: Request, name: []const u8) FormError![]const []const u8 {
-        if (!self.hasContentType("application/x-www-form-urlencoded") or self.body.len == 0) return &.{};
-
-        var values: std.ArrayListUnmanaged([]const u8) = .empty;
-        errdefer values.deinit(self.allocator);
-
-        var rest = self.body;
-        while (rest.len > 0) {
-            const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
-            const pair = rest[0..amp];
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-            const key_raw = pair[0..eq];
-            const value_raw = if (eq < pair.len) pair[eq + 1 ..] else "";
-            const decoded_key = try decodeFormComponent(self.allocator, key_raw);
-            if (std.mem.eql(u8, decoded_key, name)) {
-                try values.append(self.allocator, try decodeFormComponent(self.allocator, value_raw));
-            }
-            rest = if (amp < rest.len) rest[amp + 1 ..] else "";
-        }
-
-        if (values.items.len == 0) return &.{};
-        return try values.toOwnedSlice(self.allocator);
     }
 
     const CollectedHeaders = struct {
@@ -843,9 +667,15 @@ fn CookieResultType(comptime NameType: type) type {
     @compileError("Request.cookie accepts a cookie name string or .all.");
 }
 
-fn castOpaquePtr(comptime T: type, value: ?*const anyopaque) ?*const T {
-    const raw = value orelse return null;
-    return @ptrCast(@alignCast(raw));
+fn isJsonContentTypeValue(raw_content_type: []const u8) bool {
+    const semi = std.mem.indexOfScalar(u8, raw_content_type, ';') orelse raw_content_type.len;
+    const content_type = std.mem.trim(u8, raw_content_type[0..semi], " \t");
+
+    if (std.ascii.eqlIgnoreCase(content_type, "application/json")) return true;
+    if (std.ascii.eqlIgnoreCase(content_type, "text/json")) return true;
+
+    return std.ascii.startsWithIgnoreCase(content_type, "application/") and
+        std.ascii.endsWithIgnoreCase(content_type, "+json");
 }
 
 fn isStringLike(comptime T: type) bool {
@@ -1608,40 +1438,31 @@ test "request json parses typed payloads" {
     try std.testing.expectEqualStrings("hello", parsed.value.title);
 }
 
-test "request raw accessors expose platform pointers" {
-    const RawValue = struct { code: u32 };
-    const EnvValue = struct { name: []const u8 };
-    const EventValue = struct { id: u32 };
-    const ExecValue = struct { ready: bool };
+test "request json accepts application json and vendor json media types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const raw_value = RawValue{ .code = 7 };
-    const env_value = EnvValue{ .name = "prod" };
-    const event_value = EventValue{ .id = 42 };
-    const exec_value = ExecValue{ .ready = true };
+    var req = Request.init(arena.allocator(), .POST, "/posts");
+    req.header_list = &.{
+        .{ .name = "content-type", .value = "application/problem+json; charset=utf-8" },
+    };
+    req.body = "{\"title\":\"hello\"}";
 
-    var req = Request.init(std.testing.allocator, .POST, "/");
-    req.raw = @ptrCast(&raw_value);
-    req.env = @ptrCast(&env_value);
-    req.event = @ptrCast(&event_value);
-    req.executionCtx = @ptrCast(&exec_value);
-
-    try std.testing.expectEqual(@as(u32, 7), req.rawAs(RawValue).?.code);
-    try std.testing.expectEqualStrings("prod", req.envAs(EnvValue).?.name);
-    try std.testing.expectEqual(@as(u32, 42), req.eventAs(EventValue).?.id);
-    try std.testing.expect(req.executionCtxAs(ExecValue).?.ready);
+    const parsed = (try req.json(struct { title: []const u8 })).?;
+    try std.testing.expectEqualStrings("hello", parsed.value.title);
 }
 
-test "request arrayBuffer and blob expose raw body bytes" {
-    var req = Request.init(std.testing.allocator, .POST, "/submit");
-    req.header_list = &.{
-        .{ .name = "content-type", .value = "application/octet-stream" },
-    };
-    req.body = "hello";
+test "request json rejects non-json content types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    try std.testing.expectEqualStrings("hello", req.arrayBuffer());
-    const blob = req.blob();
-    try std.testing.expectEqualStrings("hello", blob.bytes);
-    try std.testing.expectEqualStrings("application/octet-stream", blob.content_type.?);
+    var req = Request.init(arena.allocator(), .POST, "/posts");
+    req.header_list = &.{
+        .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
+    };
+    req.body = "{\"title\":\"hello\"}";
+
+    try std.testing.expectError(error.UnsupportedContentType, req.json(struct { title: []const u8 }));
 }
 
 test "request contentType ignores parameters" {
@@ -1653,39 +1474,6 @@ test "request contentType ignores parameters" {
     try std.testing.expectEqualStrings("application/x-www-form-urlencoded", req.contentType().?);
     try std.testing.expect(req.hasContentType("application/x-www-form-urlencoded"));
     try std.testing.expect(!req.hasContentType("application/json"));
-}
-
-test "request formValue decodes urlencoded bodies" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var req = Request.init(arena.allocator(), .POST, "/submit");
-    req.header_list = &.{
-        .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
-    };
-    req.body = "title=hello+world&note=zig%2Bweb&empty";
-
-    try std.testing.expectEqualStrings("hello world", (try req.formValue("title")).?);
-    try std.testing.expectEqualStrings("zig+web", (try req.formValue("note")).?);
-    try std.testing.expectEqualStrings("", (try req.formValue("empty")).?);
-    try std.testing.expect((try req.formValue("missing")) == null);
-}
-
-test "request formValues collects repeated fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var req = Request.init(arena.allocator(), .POST, "/submit");
-    req.header_list = &.{
-        .{ .name = "content-type", .value = "application/x-www-form-urlencoded; charset=utf-8" },
-    };
-    req.body = "tag=zig&tag=web+toolkit&tag=router";
-
-    const values = try req.formValues("tag");
-    try std.testing.expectEqual(@as(usize, 3), values.len);
-    try std.testing.expectEqualStrings("zig", values[0]);
-    try std.testing.expectEqualStrings("web toolkit", values[1]);
-    try std.testing.expectEqualStrings("router", values[2]);
 }
 
 test "request parseBody keeps the last scalar value and preserves array-like keys" {
@@ -1793,58 +1581,6 @@ test "request parseBody multipart all collects repeated fields" {
     try std.testing.expectEqualStrings("web toolkit", tags[1]);
 }
 
-test "request parseMultipart returns text fields and files" {
-    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
-    };
-    parsed_req.body =
-        "--zono-boundary\r\n" ++
-        "Content-Disposition: form-data; name=\"title\"\r\n\r\n" ++
-        "hello world\r\n" ++
-        "--zono-boundary\r\n" ++
-        "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.txt\"\r\n" ++
-        "Content-Type: text/plain\r\n\r\n" ++
-        "hello\r\n" ++
-        "--zono-boundary--\r\n";
-
-    var multipart = try parsed_req.parseMultipart(.{});
-    defer multipart.deinit();
-
-    try std.testing.expectEqualStrings("hello world", multipart.value("title").?);
-
-    const avatar = multipart.file("avatar").?;
-    try std.testing.expectEqualStrings("a.txt", avatar.filename);
-    try std.testing.expectEqualStrings("text/plain", avatar.content_type.?);
-    try std.testing.expectEqualStrings("hello", avatar.content);
-}
-
-test "request parseMultipart collects repeated files" {
-    var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
-    parsed_req.header_list = &.{
-        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
-    };
-    parsed_req.body =
-        "--zono-boundary\r\n" ++
-        "Content-Disposition: form-data; name=\"photos[]\"; filename=\"a.txt\"\r\n\r\n" ++
-        "A\r\n" ++
-        "--zono-boundary\r\n" ++
-        "Content-Disposition: form-data; name=\"photos[]\"; filename=\"b.txt\"\r\n\r\n" ++
-        "B\r\n" ++
-        "--zono-boundary--\r\n";
-
-    var multipart = try parsed_req.parseMultipart(.{});
-    defer multipart.deinit();
-
-    const photos = multipart.fileValues("photos[]").?;
-    try std.testing.expectEqual(@as(usize, 2), photos.len);
-    try std.testing.expectEqualStrings("a.txt", photos[0].filename);
-    try std.testing.expectEqualStrings("A", photos[0].content);
-    try std.testing.expectEqualStrings("b.txt", photos[1].filename);
-    try std.testing.expectEqualStrings("B", photos[1].content);
-    try std.testing.expect(multipart.getFile("photos[]").?.isArray());
-}
-
 test "request parseBody multipart returns files directly" {
     var parsed_req = Request.init(std.testing.allocator, .POST, "/submit");
     parsed_req.header_list = &.{
@@ -1869,23 +1605,6 @@ test "request parseBody multipart returns files directly" {
     try std.testing.expectEqualStrings("a.txt", avatar.filename);
     try std.testing.expectEqualStrings("text/plain", avatar.content_type.?);
     try std.testing.expectEqualStrings("hello", avatar.content);
-}
-
-test "request formData preserves repeated values" {
-    var req = Request.init(std.testing.allocator, .POST, "/submit");
-    req.header_list = &.{
-        .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
-    };
-    req.body = "tag=zig&tag=router&title=zono";
-
-    var form = try req.formData();
-    defer form.deinit();
-
-    const tags = form.values("tag").?;
-    try std.testing.expectEqual(@as(usize, 2), tags.len);
-    try std.testing.expectEqualStrings("zig", tags[0]);
-    try std.testing.expectEqualStrings("router", tags[1]);
-    try std.testing.expectEqualStrings("zono", form.value("title").?);
 }
 
 test "request param .all returns an aggregated params view" {

@@ -1,6 +1,6 @@
 const std = @import("std");
-const Request = @import("request.zig").Request;
 const EpochSeconds = std.time.epoch.EpochSeconds;
+const Request = @import("request.zig").Request;
 
 pub const SameSite = enum {
     strict,
@@ -46,37 +46,6 @@ pub const CookieError = std.mem.Allocator.Error || error{
     HostPrefixRequiresSecure,
     HostPrefixRequiresPathRoot,
     HostPrefixDisallowsDomain,
-};
-
-pub const StreamOptions = struct {
-    status: std.http.Status = .ok,
-    content_type: []const u8 = "application/octet-stream",
-    content_length: ?u64 = null,
-};
-
-pub const StreamWriter = struct {
-    body_writer: *std.http.BodyWriter,
-
-    pub fn writeAll(self: *StreamWriter, bytes: []const u8) std.http.BodyWriter.Error!void {
-        try self.body_writer.writer.writeAll(bytes);
-    }
-
-    pub fn print(self: *StreamWriter, comptime fmt: []const u8, args: anytype) std.http.BodyWriter.Error!void {
-        try self.body_writer.writer.print(fmt, args);
-    }
-
-    pub fn flush(self: *StreamWriter) std.http.BodyWriter.Error!void {
-        try self.body_writer.flush();
-    }
-};
-
-pub const StreamRunFn = *const fn (ctx: *const anyopaque, writer: *StreamWriter) anyerror!void;
-
-pub const StreamRuntime = struct {
-    ctx: *const anyopaque,
-    run_fn: StreamRunFn,
-    content_length: ?u64 = null,
-    deinit_fn: ?*const fn (allocator: std.mem.Allocator, ctx: *const anyopaque) void = null,
 };
 
 pub const WebSocketConnection = struct {
@@ -125,7 +94,6 @@ pub const WebSocketRuntime = struct {
 
 pub const Runtime = union(enum) {
     none,
-    stream: StreamRuntime,
     websocket: WebSocketRuntime,
 };
 
@@ -333,7 +301,6 @@ pub const Response = struct {
 
     pub fn deinit(self: *Response) void {
         if (self.runtime_allocator) |allocator| switch (self.runtime) {
-            .stream => |runtime| if (runtime.deinit_fn) |deinit_fn| deinit_fn(allocator, runtime.ctx),
             .websocket => |runtime| if (runtime.deinit_fn) |deinit_fn| deinit_fn(allocator, runtime.ctx),
             .none => {},
         };
@@ -544,24 +511,6 @@ pub fn body(status: std.http.Status, content_type: []const u8, content: []const 
     };
 }
 
-pub fn streamRuntime(stream_options: StreamOptions, runtime: StreamRuntime) Response {
-    return .{
-        .status = stream_options.status,
-        .content_type = stream_options.content_type,
-        .body = "",
-        .runtime = .{ .stream = runtime },
-    };
-}
-
-pub fn websocketRuntime(runtime: WebSocketRuntime) Response {
-    return .{
-        .status = .switching_protocols,
-        .content_type = "",
-        .body = "",
-        .runtime = .{ .websocket = runtime },
-    };
-}
-
 pub fn html(content: []const u8) Response {
     return @This().body(.ok, "text/html; charset=utf-8", content);
 }
@@ -607,6 +556,15 @@ pub fn methodNotAllowed(allow: []const u8) Response {
 
 pub fn internalError(message: []const u8) Response {
     return text(.internal_server_error, message);
+}
+
+pub fn websocketRuntime(runtime: WebSocketRuntime) Response {
+    return .{
+        .status = .switching_protocols,
+        .content_type = "",
+        .body = "",
+        .runtime = .{ .websocket = runtime },
+    };
 }
 
 pub fn typedJson(allocator: std.mem.Allocator, value: anytype) Response {

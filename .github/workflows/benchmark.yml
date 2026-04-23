@@ -1,4 +1,4 @@
-name: Benchmark - zono vs merjs vs Next.js
+name: Benchmark - zono vs merjs vs Hono vs Next.js
 
 on:
   push:
@@ -453,12 +453,167 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+  benchmark_hono:
+    runs-on: ubuntu-latest
+    name: Hono API benchmark
+    outputs:
+      build_ms: ${{ steps.bench.outputs.build_ms }}
+      node_modules_size: ${{ steps.bench.outputs.node_modules_size }}
+      node_modules_bytes: ${{ steps.bench.outputs.node_modules_bytes }}
+      node_modules_files: ${{ steps.bench.outputs.node_modules_files }}
+      bundle_size: ${{ steps.bench.outputs.bundle_size }}
+      requests_per_sec: ${{ steps.bench.outputs.requests_per_sec }}
+      avg_latency: ${{ steps.bench.outputs.avg_latency }}
+      ram_mb: ${{ steps.bench.outputs.ram_mb }}
+      bun_version: ${{ steps.bench.outputs.bun_version }}
+      hono_version: ${{ steps.bench.outputs.hono_version }}
+
+    steps:
+      - name: Setup Bun
+        id: setup_bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install wrk
+        run: sudo apt-get update && sudo apt-get install -y wrk
+
+      - name: Benchmark Hono
+        id: bench
+        env:
+          BUN_VERSION: ${{ steps.setup_bun.outputs.bun-version }}
+        run: |
+          set -euo pipefail
+
+          read_rss_kb() {
+            local pid="$1"
+            local rss
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [ -z "$rss" ]; then
+              echo 0
+            else
+              echo "$rss"
+            fi
+          }
+
+          mkdir -p hono-baseline
+          cd hono-baseline
+          cat > package.json <<'EOF'
+          {
+            "name": "hono-baseline",
+            "private": true,
+            "type": "module",
+            "dependencies": {
+              "hono": "latest"
+            }
+          }
+          EOF
+
+          bun install
+
+          cat > index.ts <<'EOF'
+          import { Hono } from 'hono'
+
+          const app = new Hono()
+
+          app.get('/api/json', (c) => {
+            return c.json({ ok: true, framework: 'hono' })
+          })
+
+          Bun.serve({
+            port: 3004,
+            fetch: app.fetch,
+          })
+          EOF
+
+          HONO_VERSION=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path("package.json").read_text(encoding="utf-8"))
+          print(data["dependencies"]["hono"])
+          PY
+          )
+
+          START=$(date +%s%N)
+          mkdir -p dist
+          bun build index.ts --outfile dist/server.js --target bun
+          END=$(date +%s%N)
+          BUILD_MS=$(( (END - START) / 1000000 ))
+
+          HONO_NM_SIZE=$(du -sh node_modules | cut -f1)
+          HONO_NM_BYTES=$(du -sb node_modules | cut -f1)
+          HONO_NM_FILES=$(find node_modules -type f | wc -l)
+          HONO_BUNDLE_SIZE=$(du -sh dist/server.js | cut -f1)
+
+          bun dist/server.js &
+          HONO_PID=$!
+          trap 'kill $HONO_PID 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3004/api/json >/dev/null; then
+              break
+            fi
+            sleep 1
+            if [ "$attempt" -eq 30 ]; then
+              echo "Hono baseline did not become ready in time" >&2
+              exit 1
+            fi
+          done
+
+          if [ $((BENCH_RUNS % 2)) -eq 0 ]; then
+            echo "BENCH_RUNS must be an odd number to compute a median" >&2
+            exit 1
+          fi
+
+          echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s http://127.0.0.1:3004/api/json"
+          wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" http://127.0.0.1:3004/api/json >/dev/null
+
+          RESULT_FILE=$(mktemp)
+          trap 'rm -f "$RESULT_FILE"; kill $HONO_PID 2>/dev/null || true' EXIT
+          HONO_RSS_KB=$(read_rss_kb "$HONO_PID")
+
+          for run in $(seq 1 "$BENCH_RUNS"); do
+            echo "Measured run $run/$BENCH_RUNS: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3004/api/json"
+            WRK_OUT=$(wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" http://127.0.0.1:3004/api/json)
+            echo "$WRK_OUT"
+
+            HONO_RPS=$(echo "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+            HONO_LAT=$(echo "$WRK_OUT" | awk '/Latency/ {print $2 " " $3}')
+            printf '%s\t%s\t%s\n' "$run" "$HONO_RPS" "$HONO_LAT" >> "$RESULT_FILE"
+
+            HONO_RSS_AFTER=$(read_rss_kb "$HONO_PID")
+            if [ "$HONO_RSS_AFTER" -gt "$HONO_RSS_KB" ]; then
+              HONO_RSS_KB=$HONO_RSS_AFTER
+            fi
+          done
+
+          MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
+          HONO_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
+          HONO_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3-)
+          HONO_RAM_MB=$(awk "BEGIN{printf \"%.1f\", ${HONO_RSS_KB:-0} / 1024}")
+
+          {
+            echo "build_ms=$BUILD_MS"
+            echo "node_modules_size=$HONO_NM_SIZE"
+            echo "node_modules_bytes=$HONO_NM_BYTES"
+            echo "node_modules_files=$HONO_NM_FILES"
+            echo "bundle_size=$HONO_BUNDLE_SIZE"
+            echo "requests_per_sec=$HONO_RPS"
+            echo "ram_mb=$HONO_RAM_MB"
+            echo "bun_version=$BUN_VERSION"
+            echo "hono_version=$HONO_VERSION"
+            echo "avg_latency<<EOF"
+            echo "$HONO_LAT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
   publish_benchmark:
     runs-on: ubuntu-latest
     name: Publish benchmark summary
     needs:
       - benchmark_zono
       - benchmark_merjs
+      - benchmark_hono
       - benchmark_nextjs
     if: ${{ always() }}
     env:
@@ -485,6 +640,18 @@ jobs:
       MERJS_ZIG_VERSION: ${{ needs.benchmark_merjs.outputs.zig_version || '0.16.0' }}
       MERJS_BASELINE_REF: ${{ needs.benchmark_merjs.outputs.baseline_ref || 'v0.2.5' }}
 
+      HONO_RESULT: ${{ needs.benchmark_hono.result }}
+      HONO_BUILD_MS: ${{ needs.benchmark_hono.outputs.build_ms || '0' }}
+      HONO_NODE_MODULES_SIZE: ${{ needs.benchmark_hono.outputs.node_modules_size || 'n/a' }}
+      HONO_NODE_MODULES_BYTES: ${{ needs.benchmark_hono.outputs.node_modules_bytes || '0' }}
+      HONO_NODE_MODULES_FILES: ${{ needs.benchmark_hono.outputs.node_modules_files || '0' }}
+      HONO_BUNDLE_SIZE: ${{ needs.benchmark_hono.outputs.bundle_size || 'n/a' }}
+      HONO_RPS: ${{ needs.benchmark_hono.outputs.requests_per_sec || 'n/a' }}
+      HONO_LAT: ${{ needs.benchmark_hono.outputs.avg_latency || 'n/a' }}
+      HONO_RAM_MB: ${{ needs.benchmark_hono.outputs.ram_mb || 'n/a' }}
+      HONO_BUN_VERSION: ${{ needs.benchmark_hono.outputs.bun_version || 'latest' }}
+      HONO_VERSION: ${{ needs.benchmark_hono.outputs.hono_version || 'latest' }}
+
       NEXTJS_RESULT: ${{ needs.benchmark_nextjs.result }}
       NEXTJS_BUILD_MS: ${{ needs.benchmark_nextjs.outputs.build_ms || '0' }}
       NEXTJS_NODE_MODULES_SIZE: ${{ needs.benchmark_nextjs.outputs.node_modules_size || 'n/a' }}
@@ -506,7 +673,7 @@ jobs:
           ## Backend API Benchmark
 
           Target routes:
-          `GET /api/json` for zono, merjs, and Next.js
+          `GET /api/json` for zono, merjs, Hono, and Next.js
           `GET /api/context-json` for zono Context handlers
 
           Response shape:
@@ -520,30 +687,31 @@ jobs:
 
           echo "| zono | $ZONO_RESULT | Zig $ZONO_ZIG_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "| merjs | $MERJS_RESULT | Zig $MERJS_ZIG_VERSION (\`$MERJS_BASELINE_REF\` release) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Hono | $HONO_RESULT | Bun $HONO_BUN_VERSION + Hono $HONO_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "| Next.js | $NEXTJS_RESULT | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### Results
 
-          | Metric | **zono** | **merjs** | **Next.js** |
-          |--------|----------|-----------|-------------|
+          | Metric | **zono** | **merjs** | **Hono** | **Next.js** |
+          |--------|----------|-----------|----------|-------------|
           EOF
 
-          echo "| Server binary / node_modules | $ZONO_BINARY_SIZE | $MERJS_BINARY_SIZE | $NEXTJS_NODE_MODULES_SIZE |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build output | - | - | $NEXTJS_DOT_NEXT_SIZE (.next/) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Source files / node_modules files | $ZONO_SOURCE_FILES files | $MERJS_SOURCE_FILES files | $NEXTJS_NODE_MODULES_FILES files |" >> $GITHUB_STEP_SUMMARY
-          echo "| Runtime deps | 0 | 0 | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Requests/sec** (wrk median, ${BENCH_THREADS}t/${BENCH_CONNECTIONS}c/${BENCH_DURATION_SECONDS}s) | **${ZONO_RPS}** | **${MERJS_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Requests/sec (context route)** | **${ZONO_CONTEXT_RPS}** | - | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Avg latency** | **${ZONO_LAT}** | **${MERJS_LAT}** | **${NEXTJS_LAT}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Avg latency (context route)** | **${ZONO_CONTEXT_LAT}** | - | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| **RAM usage** (under load) | **${ZONO_RAM_MB} MB** | **${MERJS_RAM_MB} MB** | **${NEXTJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Server binary / node_modules | $ZONO_BINARY_SIZE | $MERJS_BINARY_SIZE | $HONO_NODE_MODULES_SIZE | $NEXTJS_NODE_MODULES_SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build output | - | - | $HONO_BUNDLE_SIZE (dist/server.js) | $NEXTJS_DOT_NEXT_SIZE (.next/) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source files / node_modules files | $ZONO_SOURCE_FILES files | $MERJS_SOURCE_FILES files | $HONO_NODE_MODULES_FILES files | $NEXTJS_NODE_MODULES_FILES files |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime deps | 0 | 0 | Bun $HONO_BUN_VERSION + Hono $HONO_VERSION | Bun $NEXTJS_BUN_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requests/sec** (wrk median, ${BENCH_THREADS}t/${BENCH_CONNECTIONS}c/${BENCH_DURATION_SECONDS}s) | **${ZONO_RPS}** | **${MERJS_RPS}** | **${HONO_RPS}** | **${NEXTJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requests/sec (context route)** | **${ZONO_CONTEXT_RPS}** | - | - | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Avg latency** | **${ZONO_LAT}** | **${MERJS_LAT}** | **${HONO_LAT}** | **${NEXTJS_LAT}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Avg latency (context route)** | **${ZONO_CONTEXT_LAT}** | - | - | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| **RAM usage** (under load) | **${ZONO_RAM_MB} MB** | **${MERJS_RAM_MB} MB** | **${HONO_RAM_MB} MB** | **${NEXTJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> Three isolated benchmark jobs run in parallel. Each target gets one ${BENCH_WARMUP_SECONDS}s warmup plus ${BENCH_RUNS} measured wrk runs, and the published Requests/sec is the median run with its matching latency. merjs uses upstream release tag \`$MERJS_BASELINE_REF\`; Linux CI switches to its shipped threaded runtime fallback because the default io_uring path currently fails to compile under ubuntu-latest." >> $GITHUB_STEP_SUMMARY
+          echo "> Four isolated benchmark jobs run in parallel. Each target gets one ${BENCH_WARMUP_SECONDS}s warmup plus ${BENCH_RUNS} measured wrk runs, and the published Requests/sec is the median run with its matching latency. merjs uses upstream release tag \`$MERJS_BASELINE_REF\`; Linux CI switches to its shipped threaded runtime fallback because the default io_uring path currently fails to compile under ubuntu-latest." >> $GITHUB_STEP_SUMMARY
 
       - name: Fail if any benchmark job failed
-        if: ${{ needs.benchmark_zono.result != 'success' || needs.benchmark_merjs.result != 'success' || needs.benchmark_nextjs.result != 'success' }}
+        if: ${{ needs.benchmark_zono.result != 'success' || needs.benchmark_merjs.result != 'success' || needs.benchmark_hono.result != 'success' || needs.benchmark_nextjs.result != 'success' }}
         run: |
           echo "::error::One or more benchmark jobs failed; README and benchmarks/latest.json were not updated."
           exit 1
@@ -572,6 +740,7 @@ jobs:
                   "zono_route": "/api/json",
                   "zono_context_route": "/api/context-json",
                   "merjs_route": "/api/json",
+                  "hono_route": "/api/json",
                   "nextjs_route": "/api/json",
                   "example": "benchmark",
               },
@@ -598,6 +767,17 @@ jobs:
                   "zig_version": os.environ["MERJS_ZIG_VERSION"],
                   "baseline_ref": os.environ["MERJS_BASELINE_REF"],
               },
+              "hono": {
+                  "requests_per_sec": float(os.environ["HONO_RPS"]),
+                  "avg_latency_ms": os.environ["HONO_LAT"],
+                  "ram_mb": float(os.environ["HONO_RAM_MB"]),
+                  "node_modules_size": os.environ["HONO_NODE_MODULES_SIZE"],
+                  "node_modules_bytes": int(os.environ["HONO_NODE_MODULES_BYTES"]),
+                  "node_modules_files": int(os.environ["HONO_NODE_MODULES_FILES"]),
+                  "bundle_size": os.environ["HONO_BUNDLE_SIZE"],
+                  "bun_version": os.environ["HONO_BUN_VERSION"],
+                  "hono_version": os.environ["HONO_VERSION"],
+              },
               "nextjs": {
                   "requests_per_sec": float(os.environ["NEXTJS_RPS"]),
                   "avg_latency_ms": os.environ["NEXTJS_LAT"],
@@ -623,13 +803,13 @@ jobs:
           import re
 
           block = "\n".join([
-              "| Metric | **zono** | **merjs** | **Next.js** |",
-              "|--------|----------|-----------|-------------|",
-              f'| Requests/sec (wrk median) | **{os.environ["ZONO_RPS"]}** | **{os.environ["MERJS_RPS"]}** | **{os.environ["NEXTJS_RPS"]}** |',
-              f'| Requests/sec (context route) | **{os.environ["ZONO_CONTEXT_RPS"]}** | - | - |',
-              f'| Avg latency | **{os.environ["ZONO_LAT"]}** | **{os.environ["MERJS_LAT"]}** | **{os.environ["NEXTJS_LAT"]}** |',
-              f'| Avg latency (context route) | **{os.environ["ZONO_CONTEXT_LAT"]}** | - | - |',
-              f'| RAM usage (under load) | **{os.environ["ZONO_RAM_MB"]} MB** | **{os.environ["MERJS_RAM_MB"]} MB** | **{os.environ["NEXTJS_RAM_MB"]} MB** |',
+              "| Metric | **zono** | **merjs** | **Hono** | **Next.js** |",
+              "|--------|----------|-----------|----------|-------------|",
+              f'| Requests/sec (wrk median) | **{os.environ["ZONO_RPS"]}** | **{os.environ["MERJS_RPS"]}** | **{os.environ["HONO_RPS"]}** | **{os.environ["NEXTJS_RPS"]}** |',
+              f'| Requests/sec (context route) | **{os.environ["ZONO_CONTEXT_RPS"]}** | - | - | - |',
+              f'| Avg latency | **{os.environ["ZONO_LAT"]}** | **{os.environ["MERJS_LAT"]}** | **{os.environ["HONO_LAT"]}** | **{os.environ["NEXTJS_LAT"]}** |',
+              f'| Avg latency (context route) | **{os.environ["ZONO_CONTEXT_LAT"]}** | - | - | - |',
+              f'| RAM usage (under load) | **{os.environ["ZONO_RAM_MB"]} MB** | **{os.environ["MERJS_RAM_MB"]} MB** | **{os.environ["HONO_RAM_MB"]} MB** | **{os.environ["NEXTJS_RAM_MB"]} MB** |',
           ])
 
           with open("README.md", "r", encoding="utf-8") as fh:

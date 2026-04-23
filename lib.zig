@@ -6,12 +6,17 @@ pub const response = root.response;
 pub const router = root.router;
 pub const app = root.app;
 pub const context = root.context;
+pub const http_exception = root.http_exception;
+pub const route_helper = root.route_helper;
 pub const server = root.server;
+pub const validator_helper = root.validator_helper;
 pub const path = root.path;
 
 pub const Request = root.Request;
 pub const Param = root.Param;
 pub const Header = root.Header;
+pub const MatchedRoute = root.MatchedRoute;
+pub const MatchedRouteKind = root.MatchedRouteKind;
 pub const ValidationTarget = root.ValidationTarget;
 pub const RequestBlob = root.RequestBlob;
 pub const ParseBodyError = root.ParseBodyError;
@@ -41,12 +46,15 @@ pub const Server = root.Server;
 pub const Options = root.Options;
 pub const AppOptions = root.AppOptions;
 pub const AppRequestOptions = root.AppRequestOptions;
+pub const RawRequest = root.RawRequest;
+pub const FetchRawOptions = root.FetchRawOptions;
 pub const CookieOptions = root.CookieOptions;
 pub const DeleteCookieOptions = root.DeleteCookieOptions;
 pub const CookieError = root.CookieError;
 pub const SameSite = root.SameSite;
 pub const CookiePriority = root.CookiePriority;
 pub const CookiePrefix = root.CookiePrefix;
+pub const HTTPException = root.HTTPException;
 
 pub const html = root.html;
 pub const body = root.body;
@@ -63,6 +71,10 @@ pub const generateCookie = root.generateCookie;
 pub const generateDeleteCookie = root.generateDeleteCookie;
 pub const cleanPath = root.cleanPath;
 pub const routeOnError = root.routeOnError;
+pub const validator = root.validator;
+pub const routePath = root.routePath;
+pub const baseRoutePath = root.baseRoutePath;
+pub const matchedRoutes = root.matchedRoutes;
 
 test {
     _ = root;

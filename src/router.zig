@@ -11,12 +11,15 @@ pub const Route = struct {
     method: std.http.Method,
     path: []const u8,
     handler: Handler,
+    base_path: ?[]const u8 = null,
 };
 
 pub const LookupResult = struct {
     handler: ?Handler = null,
     params: []const Param = &.{},
     params_storage: ?[]Param = null,
+    route_path: ?[]const u8 = null,
+    base_route_path: ?[]const u8 = null,
     tsr: bool = false,
 };
 
@@ -47,6 +50,8 @@ const NodeType = enum {
 const Match = struct {
     handler: ?Handler = null,
     param_count: usize = 0,
+    route_path: ?[]const u8 = null,
+    base_route_path: ?[]const u8 = null,
     tsr: bool = false,
 };
 
@@ -72,6 +77,7 @@ const PatternRoute = struct {
     method: std.http.Method,
     path: []const u8,
     handler: Handler,
+    base_path: ?[]const u8 = null,
     segments: []const PatternSegment,
     max_params: usize = 0,
 };
@@ -123,14 +129,16 @@ const Node = struct {
     priority: u32 = 0,
     children: std.ArrayListUnmanaged(*Node) = .empty,
     handler: ?Handler = null,
+    route_path: ?[]const u8 = null,
+    base_route_path: ?[]const u8 = null,
 
-    fn addRoute(self: *Node, allocator: std.mem.Allocator, full_path: []const u8, handler: Handler) InitError!void {
+    fn addRoute(self: *Node, allocator: std.mem.Allocator, full_path: []const u8, base_path: ?[]const u8, handler: Handler) InitError!void {
         var n = self;
         var path = full_path;
 
         n.priority += 1;
         if (n.path.len == 0 and n.indices.items.len == 0 and n.children.items.len == 0) {
-            try n.insertChild(allocator, path, handler);
+            try n.insertChild(allocator, path, base_path, handler);
             n.n_type = .root;
             return;
         }
@@ -148,6 +156,8 @@ const Node = struct {
                     .priority = n.priority - 1,
                     .children = n.children,
                     .handler = n.handler,
+                    .route_path = n.route_path,
+                    .base_route_path = n.base_route_path,
                 };
 
                 n.children = .empty;
@@ -158,6 +168,8 @@ const Node = struct {
 
                 n.path = n.path[0..common_prefix];
                 n.handler = null;
+                n.route_path = null;
+                n.base_route_path = null;
                 n.wild_child = false;
             }
 
@@ -203,17 +215,19 @@ const Node = struct {
                     n = n.children.items[new_pos];
                 }
 
-                try n.insertChild(allocator, path, handler);
+                try n.insertChild(allocator, path, base_path, handler);
                 return;
             }
 
             if (n.handler != null) return error.DuplicateRoute;
             n.handler = handler;
+            n.route_path = full_path;
+            n.base_route_path = base_path;
             return;
         }
     }
 
-    fn insertChild(self: *Node, allocator: std.mem.Allocator, full_path: []const u8, handler: Handler) InitError!void {
+    fn insertChild(self: *Node, allocator: std.mem.Allocator, full_path: []const u8, base_path: ?[]const u8, handler: Handler) InitError!void {
         var n = self;
         var path = full_path;
 
@@ -255,6 +269,8 @@ const Node = struct {
                 }
 
                 n.handler = handler;
+                n.route_path = full_path;
+                n.base_route_path = base_path;
                 return;
             }
 
@@ -279,6 +295,8 @@ const Node = struct {
                 .n_type = .catch_all,
                 .priority = 1,
                 .handler = handler,
+                .route_path = full_path,
+                .base_route_path = base_path,
             };
             try n.children.append(allocator, child);
             return;
@@ -286,6 +304,8 @@ const Node = struct {
 
         n.path = path;
         n.handler = handler;
+        n.route_path = full_path;
+        n.base_route_path = base_path;
     }
 
     fn getValue(self: *const Node, full_path: []const u8, params: []Param) Match {
@@ -343,6 +363,8 @@ const Node = struct {
                         return .{
                             .handler = n.handler,
                             .param_count = param_count,
+                            .route_path = n.route_path,
+                            .base_route_path = n.base_route_path,
                             .tsr = n.handler == null and n.children.items.len == 1 and
                                 std.mem.eql(u8, n.children.items[0].path, "/") and
                                 n.children.items[0].handler != null,
@@ -360,6 +382,8 @@ const Node = struct {
                         return .{
                             .handler = n.handler,
                             .param_count = param_count,
+                            .route_path = n.route_path,
+                            .base_route_path = n.base_route_path,
                         };
                     },
                     else => unreachable,
@@ -397,6 +421,8 @@ const Node = struct {
             return .{
                 .handler = n.handler,
                 .param_count = param_count,
+                .route_path = n.route_path,
+                .base_route_path = n.base_route_path,
             };
         }
     }
@@ -519,7 +545,7 @@ pub const Router = struct {
             }
 
             const tree = try getOrCreateTree(&trees_list, arena_allocator, route.method);
-            try tree.root.addRoute(arena_allocator, route.path, route.handler);
+            try tree.root.addRoute(arena_allocator, route.path, route.base_path, route.handler);
             tree.max_params = @max(tree.max_params, countParams(route.path));
         }
 
@@ -544,6 +570,8 @@ pub const Router = struct {
                     .handler = match_without_params.handler,
                     .params = &.{},
                     .params_storage = null,
+                    .route_path = match_without_params.route_path,
+                    .base_route_path = match_without_params.base_route_path,
                     .tsr = match_without_params.tsr,
                 };
             } else {
@@ -553,6 +581,8 @@ pub const Router = struct {
                     .handler = match.handler,
                     .params = params[0..match.param_count],
                     .params_storage = params,
+                    .route_path = match.route_path,
+                    .base_route_path = match.base_route_path,
                     .tsr = match.tsr,
                 };
                 if (simple_result.handler == null) {
@@ -681,6 +711,8 @@ pub const Router = struct {
                         .handler = pattern_route.handler,
                         .params = &.{},
                         .params_storage = null,
+                        .route_path = pattern_route.path,
+                        .base_route_path = pattern_route.base_path,
                     };
                 }
             } else {
@@ -696,12 +728,16 @@ pub const Router = struct {
                             .handler = pattern_route.handler,
                             .params = &.{},
                             .params_storage = null,
+                            .route_path = pattern_route.path,
+                            .base_route_path = pattern_route.base_path,
                         };
                     }
                     return .{
                         .handler = pattern_route.handler,
                         .params = params[0..match.param_count],
                         .params_storage = params,
+                        .route_path = pattern_route.path,
+                        .base_route_path = pattern_route.base_path,
                     };
                 }
                 allocator.free(params);
@@ -825,6 +861,7 @@ fn appendPatternRoute(
         .method = route.method,
         .path = route.path,
         .handler = route.handler,
+        .base_path = route.base_path,
         .segments = try segments.toOwnedSlice(allocator),
         .max_params = max_params,
     });

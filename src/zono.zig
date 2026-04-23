@@ -4,12 +4,17 @@ pub const response = @import("response.zig");
 pub const router = @import("router.zig");
 pub const app = @import("app.zig");
 pub const context = @import("context.zig");
+pub const http_exception = @import("http_exception.zig");
+pub const route_helper = @import("route_helper.zig");
 pub const server = @import("server.zig");
+pub const validator_helper = @import("validator.zig");
 pub const path = @import("path.zig");
 
 pub const Request = request.Request;
 pub const Param = request.Param;
 pub const Header = request.Header;
+pub const MatchedRoute = request.MatchedRoute;
+pub const MatchedRouteKind = request.MatchedRouteKind;
 pub const ValidationTarget = request.ValidationTarget;
 pub const RequestBlob = request.RequestBlob;
 pub const ParseBodyError = request.ParseBodyError;
@@ -39,12 +44,15 @@ pub const Server = server.Server;
 pub const Options = server.Options;
 pub const AppOptions = app.App.Options;
 pub const AppRequestOptions = app.App.RequestOptions;
+pub const RawRequest = app.App.RawRequest;
+pub const FetchRawOptions = app.App.FetchRawOptions;
 pub const CookieOptions = response.CookieOptions;
 pub const DeleteCookieOptions = response.DeleteCookieOptions;
 pub const CookieError = response.CookieError;
 pub const SameSite = response.SameSite;
 pub const CookiePriority = response.CookiePriority;
 pub const CookiePrefix = response.CookiePrefix;
+pub const HTTPException = http_exception.HTTPException;
 
 pub const html = response.html;
 pub const body = response.body;
@@ -61,6 +69,10 @@ pub const generateCookie = response.generateCookie;
 pub const generateDeleteCookie = response.generateDeleteCookie;
 pub const cleanPath = path.cleanPath;
 pub const routeOnError = app.routeOnError;
+pub const validator = validator_helper.validator;
+pub const routePath = route_helper.routePath;
+pub const baseRoutePath = route_helper.baseRoutePath;
+pub const matchedRoutes = route_helper.matchedRoutes;
 
 test {
     _ = request;
@@ -68,7 +80,10 @@ test {
     _ = router;
     _ = app;
     _ = context;
+    _ = http_exception;
+    _ = route_helper;
     _ = server;
+    _ = validator_helper;
     _ = path;
 
     try std.testing.expect(!@hasDecl(@This(), "http"));

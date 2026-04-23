@@ -1,8 +1,12 @@
 const std = @import("std");
 const request_mod = @import("request.zig");
 const Request = request_mod.Request;
+const MatchedRoute = request_mod.MatchedRoute;
 const ValidationTarget = request_mod.ValidationTarget;
 const Response = @import("response.zig").Response;
+const http_exception_mod = @import("http_exception.zig");
+const HTTPException = http_exception_mod.HTTPException;
+const StoredHTTPException = http_exception_mod.StoredHTTPException;
 const Handler = @import("router.zig").Handler;
 
 const VariableEntry = struct {
@@ -22,9 +26,13 @@ pub const SharedState = struct {
     },
     variables: std.StringHashMapUnmanaged(VariableEntry) = .empty,
     validated: std.StringHashMapUnmanaged(VariableEntry) = .empty,
+    matched_routes: std.ArrayListUnmanaged(MatchedRoute) = .empty,
     renderer: ?RendererFn = null,
     not_found_handler: ?Handler = null,
     on_error_handler: ?*const fn (err: anyerror, req: Request) Response = null,
+    route_path: ?[]const u8 = null,
+    base_route_path: ?[]const u8 = null,
+    http_exception: ?StoredHTTPException = null,
     last_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator) SharedState {
@@ -37,6 +45,8 @@ pub const SharedState = struct {
         self.response.deinit();
         deinitVariableMap(self.allocator, &self.variables);
         deinitVariableMap(self.allocator, &self.validated);
+        self.matched_routes.deinit(self.allocator);
+        if (self.http_exception) |*exception| exception.deinit(self.allocator);
     }
 
     pub fn set(self: *SharedState, key: []const u8, value: anytype) std.mem.Allocator.Error!void {
@@ -61,6 +71,30 @@ pub const SharedState = struct {
 
     pub fn lookupValid(self: *const SharedState, target: ValidationTarget, type_name: []const u8) ?*const anyopaque {
         return lookupVariableValue(&self.validated, validationKey(target), type_name);
+    }
+
+    pub fn appendMatchedRoute(self: *SharedState, route: MatchedRoute) std.mem.Allocator.Error!void {
+        try self.matched_routes.append(self.allocator, route);
+    }
+
+    pub fn setRoutePath(self: *SharedState, path: ?[]const u8) void {
+        self.route_path = path;
+    }
+
+    pub fn setBaseRoutePath(self: *SharedState, path: ?[]const u8) void {
+        self.base_route_path = path;
+    }
+
+    pub fn setHttpException(self: *SharedState, exception: HTTPException) std.mem.Allocator.Error!void {
+        if (self.http_exception) |*existing| existing.deinit(self.allocator);
+        self.http_exception = try StoredHTTPException.init(self.allocator, exception);
+    }
+
+    pub fn getHttpException(self: *const SharedState) ?HTTPException {
+        return if (self.http_exception) |exception|
+            exception.view()
+        else
+            null;
     }
 };
 
@@ -142,6 +176,26 @@ pub const Context = struct {
 
     pub fn valid(self: *Context, comptime T: type, comptime target: ValidationTarget) ?T {
         return self.req.valid(T, target);
+    }
+
+    pub fn routePath(self: *Context) ?[]const u8 {
+        return self.req.routePath();
+    }
+
+    pub fn baseRoutePath(self: *Context) ?[]const u8 {
+        return self.req.baseRoutePath();
+    }
+
+    pub fn matchedRoutes(self: *Context) []const MatchedRoute {
+        return self.req.matchedRoutes();
+    }
+
+    pub fn httpException(self: *Context) ?HTTPException {
+        return self.req.httpException();
+    }
+
+    pub fn throw(self: *Context, exception: HTTPException) http_exception_mod.ThrowError {
+        return self.req.throw(exception);
     }
 
     pub fn rawAs(self: *Context, comptime T: type) ?*const T {
@@ -311,6 +365,31 @@ pub fn lookupValidatedValue(
 ) ?*const anyopaque {
     const state: *const SharedState = @ptrCast(@alignCast(ctx));
     return state.lookupValid(target, type_name);
+}
+
+pub fn lookupRoutePath(ctx: *const anyopaque) ?[]const u8 {
+    const state: *const SharedState = @ptrCast(@alignCast(ctx));
+    return state.route_path;
+}
+
+pub fn lookupBaseRoutePath(ctx: *const anyopaque) ?[]const u8 {
+    const state: *const SharedState = @ptrCast(@alignCast(ctx));
+    return state.base_route_path;
+}
+
+pub fn lookupMatchedRoutes(ctx: *const anyopaque) []const MatchedRoute {
+    const state: *const SharedState = @ptrCast(@alignCast(ctx));
+    return state.matched_routes.items;
+}
+
+pub fn storeHttpException(ctx: *const anyopaque, exception: HTTPException) std.mem.Allocator.Error!void {
+    const state: *SharedState = @ptrCast(@alignCast(@constCast(ctx)));
+    try state.setHttpException(exception);
+}
+
+pub fn lookupHttpException(ctx: *const anyopaque) ?HTTPException {
+    const state: *const SharedState = @ptrCast(@alignCast(ctx));
+    return state.getHttpException();
 }
 
 fn validationKey(target: ValidationTarget) []const u8 {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const HTTPException = @import("http_exception.zig").HTTPException;
 
 pub const Param = struct {
     key: []const u8,
@@ -9,6 +10,11 @@ pub const Header = std.http.Header;
 const HeaderLookupFn = *const fn (ctx: *const anyopaque, name: []const u8) ?[]const u8;
 const HeadersCollectFn = *const fn (ctx: *const anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const Header;
 const ValidationLookupFn = *const fn (ctx: *const anyopaque, target: ValidationTarget, type_name: []const u8) ?*const anyopaque;
+const RoutePathLookupFn = *const fn (ctx: *const anyopaque) ?[]const u8;
+const BaseRoutePathLookupFn = *const fn (ctx: *const anyopaque) ?[]const u8;
+const MatchedRoutesLookupFn = *const fn (ctx: *const anyopaque) []const MatchedRoute;
+const HttpExceptionStoreFn = *const fn (ctx: *const anyopaque, exception: HTTPException) std.mem.Allocator.Error!void;
+const HttpExceptionLoadFn = *const fn (ctx: *const anyopaque) ?HTTPException;
 pub const FormError = std.mem.Allocator.Error || error{
     InvalidPercentEncoding,
 };
@@ -26,6 +32,17 @@ pub const ValidationTarget = enum {
     header,
     cookie,
     param,
+};
+
+pub const MatchedRouteKind = enum {
+    middleware,
+    route,
+    mount,
+};
+
+pub const MatchedRoute = struct {
+    path: []const u8,
+    kind: MatchedRouteKind,
 };
 
 pub const RequestBlob = struct {
@@ -324,6 +341,16 @@ pub const Request = struct {
     headers_collect_fn: ?HeadersCollectFn = null,
     validation_lookup_ctx: ?*const anyopaque = null,
     validation_lookup_fn: ?ValidationLookupFn = null,
+    route_path_value: ?[]const u8 = null,
+    base_route_path_value: ?[]const u8 = null,
+    matched_route_list: []const MatchedRoute = &.{},
+    route_lookup_ctx: ?*const anyopaque = null,
+    route_path_lookup_fn: ?RoutePathLookupFn = null,
+    base_route_path_lookup_fn: ?BaseRoutePathLookupFn = null,
+    matched_routes_lookup_fn: ?MatchedRoutesLookupFn = null,
+    http_exception_ctx: ?*const anyopaque = null,
+    http_exception_store_fn: ?HttpExceptionStoreFn = null,
+    http_exception_load_fn: ?HttpExceptionLoadFn = null,
     params: []const Param = &.{},
     context_state: ?*anyopaque = null,
 
@@ -361,6 +388,39 @@ pub const Request = struct {
         const value_ptr = lookup(ctx, target, @typeName(T)) orelse return null;
         const typed_value: *const T = @ptrCast(@alignCast(value_ptr));
         return typed_value.*;
+    }
+
+    pub fn routePath(self: Request) ?[]const u8 {
+        const lookup = self.route_path_lookup_fn orelse return self.route_path_value;
+        const ctx = self.route_lookup_ctx orelse return self.route_path_value;
+        return lookup(ctx) orelse self.route_path_value;
+    }
+
+    pub fn baseRoutePath(self: Request) ?[]const u8 {
+        const lookup = self.base_route_path_lookup_fn orelse return self.base_route_path_value;
+        const ctx = self.route_lookup_ctx orelse return self.base_route_path_value;
+        return lookup(ctx) orelse self.base_route_path_value;
+    }
+
+    pub fn matchedRoutes(self: Request) []const MatchedRoute {
+        const lookup = self.matched_routes_lookup_fn orelse return self.matched_route_list;
+        const ctx = self.route_lookup_ctx orelse return self.matched_route_list;
+        return lookup(ctx);
+    }
+
+    pub fn httpException(self: Request) ?HTTPException {
+        const lookup = self.http_exception_load_fn orelse return null;
+        const ctx = self.http_exception_ctx orelse return null;
+        return lookup(ctx);
+    }
+
+    pub fn throw(self: Request, exception: @import("http_exception.zig").ThrowErrorValue) @import("http_exception.zig").ThrowError {
+        if (self.http_exception_store_fn) |store| {
+            if (self.http_exception_ctx) |ctx| {
+                store(ctx, exception) catch return error.OutOfMemory;
+            }
+        }
+        return error.HTTPException;
     }
 
     pub fn param(self: Request, name_or_mode: anytype) ParamResultType(@TypeOf(name_or_mode)) {

@@ -14,6 +14,7 @@
     "zono_route": "/api/json",
     "zono_context_route": "/api/context-json",
     "merjs_route": "/api/json",
+    "hono_route": "/api/json",
     "nextjs_route": "/api/json",
     "example": "benchmark"
   },
@@ -40,6 +41,7 @@
     "zig_version": "0.16.0",
     "baseline_ref": "v0.2.5"
   },
+  "hono": null,
   "nextjs": {
     "requests_per_sec": 1481.82,
     "avg_latency_ms": "87.87ms 161.76ms",

@@ -10,14 +10,16 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Hono-inspired route composition and middleware with `basePath()`, `route()`, `mount()`, `use()`, `useAt()`, `on()`, and `all()`
 - Minimal Hono-style `Context` handlers and middleware through `fn(c: *zono.Context) zono.Response`
 - App-level and route-level error handling through `app.onError()`, `zono.routeOnError()`, and `!zono.Response` handlers
+- Route metadata helpers through `req.routePath()`, `req.baseRoutePath()`, `req.matchedRoutes()`, and `zono.routePath(...)`
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zono.Server`
 - Request helpers for params, parsed params/query/cookie/header views, `.all` aggregate access, cookies, and typed JSON parsing
 - `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing, and dotted-key grouping through `Request.parseBody()`, `Response.cookie()`, and a low-level `zono.body()` response helper
 - Thin platform context hooks through `req.raw`, `c.env`, `c.executionCtx`, and `c.event`
 - Web-style request body helpers through `req.arrayBuffer()`, `req.blob()`, and `req.formData()`
-- Context rendering and validated-data hooks through `c.setRenderer()`, `c.render()`, `c.setValid()`, and `req.valid()`
-- `app.request()` for lightweight route testing without the server runtime
+- Context rendering and validated-data hooks through `c.setRenderer()`, `c.render()`, `c.setValid()`, `req.valid()`, and `zono.validator(...)`
+- Lightweight `HTTPException` handling through `c.throw()` / `req.throw()`
+- `app.request()` and `app.fetchRaw()` for lightweight route testing and raw adapter entry points without the server runtime
 
 ## Quick Start
 
@@ -50,9 +52,10 @@ CI benchmarks compare:
 - A trimmed `merjs` starter-style baseline on `GET /api/json`
   based on upstream release tag `v0.2.5`
   with the release's shipped threaded runtime fallback on Linux CI
+- A generated Bun + Hono baseline on `GET /api/json`
 - A generated Next.js baseline on `GET /api/json`
 
-The three benchmarks run as isolated GitHub Actions jobs. All three baselines
+The four benchmarks run as isolated GitHub Actions jobs. All four baselines
 return the same tiny JSON payload and are warmed once before running three
 measured `wrk -t2 -c100 -d10s` samples. The table publishes the median
 Requests/sec run together with its matching latency. Build time is intentionally
@@ -64,13 +67,13 @@ runtime baseline rather than a source-build comparison.
 Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 
 <!-- BENCH:START -->
-| Metric | **zono** | **merjs** | **Next.js** |
-|--------|----------|-----------|-------------|
-| Requests/sec (wrk median) | **89032.39** | **119780.51** | **1481.82** |
-| Requests/sec (context route) | **85799.98** | - | - |
-| Avg latency | **618.07us 347.62us** | **506.93us 710.25us** | **87.87ms 161.76ms** |
-| Avg latency (context route) | **641.55us 354.18us** | - | - |
-| RAM usage (under load) | **53.5 MB** | **3.2 MB** | **9.6 MB** |
+| Metric | **zono** | **merjs** | **Hono** | **Next.js** |
+|--------|----------|-----------|----------|-------------|
+| Requests/sec (wrk median) | **89032.39** | **119780.51** | **pending CI** | **1481.82** |
+| Requests/sec (context route) | **85799.98** | - | - | - |
+| Avg latency | **618.07us 347.62us** | **506.93us 710.25us** | **pending CI** | **87.87ms 161.76ms** |
+| Avg latency (context route) | **641.55us 354.18us** | - | - | - |
+| RAM usage (under load) | **53.5 MB** | **3.2 MB** | **pending CI** | **9.6 MB** |
 <!-- BENCH:END -->
 
 ## Examples
@@ -199,6 +202,69 @@ pub fn main() !void {
 }
 ```
 
+### Route Helpers
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.basePath("/api");
+    try app.useAt("/posts", struct {
+        fn run(c: *zono.Context, next: zono.Context.Next) zono.Response {
+            next.run();
+            const route_path = zono.routePath(c) orelse "missing";
+            const base_route_path = zono.baseRoutePath(c) orelse "";
+            const matched = zono.matchedRoutes(c);
+            _ = c.header("x-route", route_path);
+            return c.textWithStatus(.ok, if (matched.len > 0) base_route_path else "missing");
+        }
+    }.run);
+    try app.get("/posts/:id", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.text(c.req.param("id") orelse "missing");
+        }
+    }.run);
+}
+```
+
+### Validator
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+const Query = struct {
+    page: u32,
+};
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.use(zono.validator(.query, struct {
+        fn run(req: zono.Request) !Query {
+            var query = try req.parseQuery(.{});
+            defer query.deinit();
+
+            const raw_page = query.value("page") orelse return error.MissingPage;
+            return .{
+                .page = try std.fmt.parseInt(u32, raw_page, 10),
+            };
+        }
+    }.run));
+    try app.get("/posts", struct {
+        fn run(req: zono.Request) zono.Response {
+            const query = req.valid(Query, .query) orelse return zono.internalError("missing query");
+            return zono.text(.ok, if (query.page == 1) "page-1" else "other");
+        }
+    }.run);
+}
+```
+
 ### Context
 
 ```zig
@@ -235,6 +301,33 @@ pub fn main() !void {
 }
 ```
 
+### HTTPException
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    app.onError(struct {
+        fn run(err: anyerror, c: *zono.Context) zono.Response {
+            if (err == error.HTTPException) {
+                const exception = c.httpException() orelse return c.textWithStatus(.internal_server_error, "missing");
+                return c.textWithStatus(exception.status, exception.message);
+            }
+            return c.textWithStatus(.internal_server_error, @errorName(err));
+        }
+    }.run);
+    try app.get("/teapot", struct {
+        fn run(c: *zono.Context) !zono.Response {
+            return c.throw(zono.HTTPException.init(.im_a_teapot, "tea"));
+        }
+    }.run);
+}
+```
+
 ### Rendering
 
 ```zig
@@ -265,6 +358,31 @@ pub fn main() !void {
             return c.render("hello");
         }
     }.run);
+}
+```
+
+### Raw Fetch Adapter
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/hello", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.json(.{
+                .mode = c.req.query("mode") orelse "",
+            });
+        }
+    }.run);
+
+    var res = try app.fetchRaw(std.heap.page_allocator, .{
+        .target = "https://example.com/hello?mode=edge",
+    }, .{});
+    defer res.deinit();
 }
 ```
 

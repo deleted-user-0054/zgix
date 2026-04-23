@@ -56,9 +56,9 @@ Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 <!-- BENCH:START -->
 | Metric | **zono** | **merjs** |
 |--------|----------|-----------|
-| Requests/sec (wrk median) | **164980.46** | **144422.98** |
-| Avg latency | **347.09us 248.67us** | **405.77us 353.11us** |
-| RAM usage (under load) | **56.0 MB** | **3.2 MB** |
+| Requests/sec (wrk median) | **105801.98** | **87473.06** |
+| Avg latency | **611.97us 2.05ms** | **673.08us 667.82us** |
+| RAM usage (under load) | **464.0 MB** | **3.2 MB** |
 <!-- BENCH:END -->
 
 ## Core API

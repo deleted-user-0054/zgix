@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-04-23T05:16:47Z",
+  "timestamp": "2026-04-23T06:06:28Z",
   "runner": "ubuntu-latest",
   "benchmark": {
     "tool": "wrk",
@@ -16,20 +16,20 @@
     "example": "benchmark"
   },
   "zono": {
-    "requests_per_sec": 105801.98,
-    "avg_latency_ms": "611.97us 2.05ms",
-    "ram_mb": 464.0,
-    "binary_size": "360K",
-    "binary_bytes": 367480,
+    "requests_per_sec": 100770.93,
+    "avg_latency_ms": "636.78us 2.10ms",
+    "ram_mb": 473.0,
+    "binary_size": "364K",
+    "binary_bytes": 369432,
     "source_files": 12,
     "zig_version": "0.16.0"
   },
   "merjs": {
-    "requests_per_sec": 87473.06,
-    "avg_latency_ms": "673.08us 667.82us",
+    "requests_per_sec": 93554.01,
+    "avg_latency_ms": "663.34us 1.21ms",
     "ram_mb": 3.2,
-    "binary_size": "1016K",
-    "binary_bytes": 1037784,
+    "binary_size": "1020K",
+    "binary_bytes": 1043464,
     "source_files": 42,
     "zig_version": "0.16.0",
     "baseline_ref": "v0.2.5"

@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const Atomic = std.atomic.Value;
@@ -114,42 +115,176 @@ pub const Server = struct {
             }
         };
 
-        var await_future = Io.concurrent(io, Drain.awaitGroup, .{ group, io }) catch {
+        const DrainSelect = union(enum) {
+            await_group: Io.Cancelable!void,
+            timer: Io.Cancelable!void,
+        };
+
+        var select_buffer: [2]DrainSelect = undefined;
+        var select = Io.Select(DrainSelect).init(io, &select_buffer);
+
+        select.concurrent(.await_group, Drain.awaitGroup, .{ group, io }) catch {
             // Could not spawn race task; fall back to cancel.
             group.cancel(io);
             return;
         };
-        var sleep_future = Io.concurrent(io, Drain.sleepFor, .{ io, self.options.shutdown_drain_ms }) catch {
-            _ = await_future.await(io) catch {};
-            return;
-        };
+        errdefer select.cancelDiscard();
 
-        // Await the sleep first; if it returns naturally, drain timed out.
-        // Cancel the await task (which in turn cancels the group). If the
-        // user's deadline was generous enough, await may have already
-        // completed; cancel of an already-finished future is a no-op.
-        _ = sleep_future.await(io) catch {};
-        _ = await_future.cancel(io) catch {};
-        // Ensure any remaining tasks are canceled and reaped.
-        group.cancel(io);
+        select.concurrent(.timer, Drain.sleepFor, .{ io, self.options.shutdown_drain_ms }) catch {
+            defer select.cancelDiscard();
+            return switch (select.await() catch {
+                group.cancel(io);
+                return;
+            }) {
+                .await_group => |result| result catch {
+                    group.cancel(io);
+                    return;
+                },
+                .timer => unreachable,
+            };
+        };
+        defer select.cancelDiscard();
+
+        switch (select.await() catch {
+            group.cancel(io);
+            return;
+        }) {
+            .await_group => |result| {
+                result catch {
+                    group.cancel(io);
+                    return;
+                };
+            },
+            .timer => |result| {
+                result catch {};
+                group.cancel(io);
+            },
+        }
     }
 };
 
-const ConnError = error{
-    Timeout,
-} || Io.Cancelable;
+// Linux/macOS threaded std.Io can enforce a read deadline directly on the
+// socket without spawning extra per-connection race tasks. Windows currently
+// reports `error.ConcurrencyUnavailable` for timed `net_receive` under
+// `Threaded`, so it keeps the outer fallback below.
+const use_socket_read_timeout = builtin.os.tag != .windows;
+
+const ServerStreamReader = struct {
+    io: Io,
+    interface: Io.Reader,
+    stream: Io.net.Stream,
+    timeout_ms: u64,
+    deadline: ?Io.Clock.Timestamp = null,
+    err: ?anyerror = null,
+
+    const max_iovecs_len = 8;
+
+    fn init(stream: Io.net.Stream, io: Io, buffer: []u8, timeout_ms: u64) ServerStreamReader {
+        return .{
+            .io = io,
+            .interface = .{
+                .vtable = &.{
+                    .stream = streamImpl,
+                    .readVec = readVec,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .stream = stream,
+            .timeout_ms = timeout_ms,
+        };
+    }
+
+    fn armRequestDeadline(self: *ServerStreamReader) void {
+        if (!use_socket_read_timeout or self.timeout_ms == 0) {
+            self.deadline = null;
+            return;
+        }
+        self.deadline = Io.Clock.Timestamp.fromNow(self.io, .{
+            .raw = .fromMilliseconds(@intCast(self.timeout_ms)),
+            .clock = .awake,
+        });
+    }
+
+    fn deadlineExceeded(self: *const ServerStreamReader) bool {
+        if (self.deadline) |deadline| {
+            return Io.Clock.Timestamp.compare(
+                deadline,
+                .lte,
+                deadline.clock.now(self.io).withClock(deadline.clock),
+            );
+        }
+        return false;
+    }
+
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *ServerStreamReader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (use_socket_read_timeout and r.deadline != null) {
+            return readVecTimed(r, io_r, data);
+        }
+        return readVecUntimed(r, io_r, data);
+    }
+
+    fn readVecUntimed(r: *ServerStreamReader, io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+        std.debug.assert(dest[0].len > 0);
+        const n = r.io.vtable.netRead(r.io.userdata, r.stream.socket.handle, dest) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            r.interface.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+
+    fn readVecTimed(r: *ServerStreamReader, io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const deadline = r.deadline orelse return readVecUntimed(r, io_r, data);
+
+        var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+        std.debug.assert(dest[0].len > 0);
+
+        const message = r.stream.socket.receiveTimeout(r.io, dest[0], .{ .deadline = deadline }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return readVecUntimed(r, io_r, data),
+            else => {
+                r.err = err;
+                return error.ReadFailed;
+            },
+        };
+        const n = message.data.len;
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            r.interface.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+};
 
 fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancelable!void {
-    if (options.request_timeout_ms == 0) {
+    if (options.request_timeout_ms == 0 or use_socket_read_timeout) {
         return runConn(io, stream, app, options);
     }
 
-    // Race the connection handler against a per-request timer. Whichever
-    // finishes first cancels the other. We re-arm the timer for each
-    // keep-alive request inside `runConn` is impractical (it lives in the
-    // accept-task scope), so we instead apply the timeout to the *entire*
-    // connection lifetime; long-lived streaming/WebSocket handlers should
-    // configure `request_timeout_ms = 0` and provide their own deadlines.
+    // Windows fallback: `Threaded` cannot currently apply timed socket reads
+    // inline, so race the connection lifetime against the configured budget.
+    // This preserves the public timeout knob without adding the extra timer
+    // workers on the Linux/macOS benchmark path.
     const Race = struct {
         fn run(inner_io: Io, s: Io.net.Stream, a: *App, opts: Options) Io.Cancelable!void {
             return runConn(inner_io, s, a, opts);
@@ -159,19 +294,34 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
         }
     };
 
-    var conn_future = Io.concurrent(io, Race.run, .{ io, stream, app, options }) catch {
+    const TimeoutSelect = union(enum) {
+        conn: Io.Cancelable!void,
+        timer: Io.Cancelable!void,
+    };
+
+    var select_buffer: [2]TimeoutSelect = undefined;
+    var select = Io.Select(TimeoutSelect).init(io, &select_buffer);
+
+    select.concurrent(.conn, Race.run, .{ io, stream, app, options }) catch {
         // Spawn failed: run inline without timeout rather than dropping the
         // connection.
         return runConn(io, stream, app, options);
     };
-    var timer_future = Io.concurrent(io, Race.timer, .{ io, options.request_timeout_ms }) catch {
-        _ = conn_future.await(io) catch {};
-        return;
-    };
+    errdefer select.cancelDiscard();
 
-    // Wait for the timer; if it expires, cancel the connection.
-    _ = timer_future.await(io) catch {};
-    _ = conn_future.cancel(io) catch {};
+    select.concurrent(.timer, Race.timer, .{ io, options.request_timeout_ms }) catch {
+        defer select.cancelDiscard();
+        return switch (try select.await()) {
+            .conn => |result| result,
+            .timer => unreachable,
+        };
+    };
+    defer select.cancelDiscard();
+
+    return switch (try select.await()) {
+        .conn => |result| result,
+        .timer => |result| result,
+    };
 }
 
 fn runConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancelable!void {
@@ -187,11 +337,12 @@ fn runConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancel
     const stream_buffer = std.heap.smp_allocator.alloc(u8, options.stream_buffer_size) catch return;
     defer std.heap.smp_allocator.free(stream_buffer);
 
-    var reader = Io.net.Stream.Reader.init(stream, io, read_buffer);
+    var reader = ServerStreamReader.init(stream, io, read_buffer, options.request_timeout_ms);
     var writer = Io.net.Stream.Writer.init(stream, io, write_buffer);
     var http_server = std.http.Server.init(&reader.interface, &writer.interface);
 
     while (true) {
+        reader.armRequestDeadline();
         _ = arena.reset(.retain_capacity);
         const alloc = arena.allocator();
 
@@ -277,10 +428,12 @@ fn runConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancel
         req.body = body;
         req.server_io = io;
 
+        if (reader.deadlineExceeded()) break;
         var response = app.handle(req);
         // Always release scopes/runtimes attached during dispatch, even on
         // an early error from `sendResponse`.
         defer response.deinit();
+        if (reader.deadlineExceeded()) break;
         const outcome = sendResponse(io, &raw_req, &response, stream_buffer) catch break;
         if (outcome == .upgraded) break;
     }
@@ -1219,4 +1372,3 @@ test "PR3: 405 returned for wrong method on existing route" {
     try testing.expect(std.mem.indexOf(u8, resp, "405") != null);
     try testing.expect(std.ascii.indexOfIgnoreCase(resp, "allow:") != null);
 }
-

@@ -275,12 +275,13 @@ fn runConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Cancel
         req.header_lookup_fn = lookupHeader;
         req.headers_collect_fn = collectHeaders;
         req.body = body;
+        req.server_io = io;
 
         var response = app.handle(req);
         // Always release scopes/runtimes attached during dispatch, even on
         // an early error from `sendResponse`.
         defer response.deinit();
-        const outcome = sendResponse(&raw_req, &response, stream_buffer) catch break;
+        const outcome = sendResponse(io, &raw_req, &response, stream_buffer) catch break;
         if (outcome == .upgraded) break;
     }
 }
@@ -303,6 +304,7 @@ fn writeStatusLineAndClose(out: *std.Io.Writer, status: std.http.Status) !void {
 }
 
 fn sendResponse(
+    io: Io,
     raw_req: *std.http.Server.Request,
     response: *const Response,
     stream_buffer: []u8,
@@ -337,7 +339,7 @@ fn sendResponse(
 
     switch (response.runtime) {
         .none => {
-            return sendBody(raw_req, response, combined_headers, stream_buffer);
+            return sendBody(io, raw_req, response, combined_headers, stream_buffer);
         },
         .websocket => |runtime| {
             const requested = raw_req.upgradeRequested();
@@ -395,10 +397,13 @@ fn lookupHeader(ctx: *const anyopaque, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Drives buffered, streaming, or SSE bodies. The streaming variants drive a
+/// Drives buffered, streaming, SSE, or file bodies. Streaming variants drive a
 /// `std.http.BodyWriter` (chunked or content-length) and surface the writer to
-/// user code through `response_mod.StreamWriter`/`SseWriter`.
+/// user code through `response_mod.StreamWriter`/`SseWriter`. `.file` opens
+/// the path relative to `cwd`, stats it for `Content-Length`, and pumps
+/// file bytes into the body writer without materializing the file in memory.
 fn sendBody(
+    io: Io,
     raw_req: *std.http.Server.Request,
     response: *const Response,
     combined_headers: []const std.http.Header,
@@ -456,7 +461,99 @@ fn sendBody(
             };
             return if (aborted.load(.acquire)) .upgraded else .keep_alive;
         },
+        .file => |runtime| {
+            return sendFileBody(io, raw_req, response, combined_headers, stream_buffer, runtime);
+        },
     }
+}
+
+/// Streams `runtime.path` into the response without buffering it all in
+/// memory. Flow:
+///   1. open the file at `cwd + runtime.path`
+///   2. stat it via `File.Reader.getSize` (sendfile-friendly path in std)
+///   3. reject with 500 if the file exceeds `runtime.max_bytes`
+///   4. `respondStreaming` with `Content-Length = size` (no chunked encoding)
+///   5. pump file bytes into the body writer via `streamRemaining`
+///
+/// On `HEAD` (`runtime.head_only`), emits identical headers with an empty
+/// body and skips the pump. On open/stat failure returns a 500; callers that
+/// want fallthrough-if-missing must pre-check existence themselves (see
+/// `serve_static.zig`).
+fn sendFileBody(
+    io: Io,
+    raw_req: *std.http.Server.Request,
+    response: *const Response,
+    combined_headers: []const std.http.Header,
+    stream_buffer: []u8,
+    runtime: response_mod.FileRuntime,
+) !SendOutcome {
+    var file = std.Io.Dir.cwd().openFile(io, runtime.path, .{}) catch {
+        try raw_req.respond("", .{
+            .status = .internal_server_error,
+            .extra_headers = combined_headers,
+        });
+        return .keep_alive;
+    };
+    defer file.close(io);
+
+    var read_buf: [8192]u8 = undefined;
+    var file_reader = std.Io.File.Reader.init(file, io, &read_buf);
+
+    const size = file_reader.getSize() catch {
+        try raw_req.respond("", .{
+            .status = .internal_server_error,
+            .extra_headers = combined_headers,
+        });
+        return .keep_alive;
+    };
+
+    if (size > runtime.max_bytes) {
+        try raw_req.respond("", .{
+            .status = .internal_server_error,
+            .extra_headers = combined_headers,
+        });
+        return .keep_alive;
+    }
+
+    if (runtime.head_only) {
+        // For HEAD, set Content-Length but emit no body. `respond` with an
+        // empty payload and the status header does the right thing; std will
+        // use `""` for the body but we want the header to advertise the real
+        // size. `respondStreaming` + immediate `end()` gives us the right
+        // framing with `content_length = size`.
+        var body_writer = try raw_req.respondStreaming(stream_buffer, .{
+            .content_length = size,
+            .respond_options = .{
+                .status = response.status,
+                .extra_headers = combined_headers,
+            },
+        });
+        // Do not write any payload; `end()` will surface a framing error if
+        // `size != 0`. For HEAD we explicitly accept that the keep-alive loop
+        // gets torn down on a sized-but-empty body, so treat end() failure as
+        // a benign close.
+        body_writer.end() catch {
+            return .upgraded;
+        };
+        return .keep_alive;
+    }
+
+    var body_writer = try raw_req.respondStreaming(stream_buffer, .{
+        .content_length = size,
+        .respond_options = .{
+            .status = response.status,
+            .extra_headers = combined_headers,
+        },
+    });
+
+    var aborted = false;
+    _ = file_reader.interface.streamRemaining(&body_writer.writer) catch {
+        aborted = true;
+    };
+    body_writer.end() catch {
+        aborted = true;
+    };
+    return if (aborted) .upgraded else .keep_alive;
 }
 
 // ---------------------------------------------------------------------------

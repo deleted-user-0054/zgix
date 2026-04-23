@@ -10,9 +10,18 @@ pub const ServeStaticOptions = struct {
     index: ?[]const u8 = "index.html",
     cache_control: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
-    max_bytes: usize = 16 * 1024 * 1024,
+    max_bytes: u64 = 16 * 1024 * 1024,
 };
 
+/// `serveStatic` hands file delivery off to the server's `sendFileBody` path
+/// (open + stat + `streamRemaining`), so large files never land in memory.
+///
+/// Fallthrough semantics: when the requested file is missing we call
+/// `next.run()` and return whatever the downstream handler produced. This
+/// requires a pre-flight existence check; we do that via `Dir.access` on the
+/// live server `Io` (`Context.io`). In test paths that call `App.handle`
+/// without a live server, we fall back to a short-lived `Io.Threaded` just
+/// for the access check so behavior matches production.
 pub fn serveStatic(comptime static_options: ServeStaticOptions) fn (*Context, Context.Next) Response {
     return struct {
         fn run(c: *Context, next: Context.Next) Response {
@@ -30,29 +39,62 @@ pub fn serveStatic(comptime static_options: ServeStaticOptions) fn (*Context, Co
             const full_path = std.fs.path.join(c.req.allocator, &.{ static_options.root, relative_path }) catch {
                 return response_mod.internalError("static path join failed");
             };
-            defer c.req.allocator.free(full_path);
 
-            var io_impl = std.Io.Threaded.init_single_threaded;
-            const io = io_impl.io();
-            const file = std.Io.Dir.cwd().readFileAlloc(io, full_path, c.req.allocator, .limited(static_options.max_bytes)) catch |err| switch (err) {
-                error.FileNotFound, error.IsDir, error.NotDir => {
-                    next.run();
-                    return c.takeResponse();
-                },
-                else => return response_mod.internalError("static file read failed"),
+            // Pre-flight existence check: preserves "fall through when
+            // missing" semantics. Uses the live server Io when available;
+            // otherwise (unit tests) a short-lived Threaded Io. This Io is
+            // only used for the access syscall and does not outlive it.
+            const exists = if (c.io()) |io|
+                fileExists(io, full_path)
+            else blk: {
+                var io_impl = std.Io.Threaded.init_single_threaded;
+                break :blk fileExists(io_impl.io(), full_path);
             };
-            defer c.req.allocator.free(file);
 
-            const body_content = if (c.req.method == .HEAD) "" else file;
-            var res = response_mod.body(.ok, static_options.content_type orelse contentTypeForPath(relative_path), body_content).clone(c.req.allocator) catch {
-                return response_mod.internalError("static response alloc failed");
+            if (!exists) {
+                c.req.allocator.free(full_path);
+                next.run();
+                return c.takeResponse();
+            }
+
+            // Path+content_type must outlive the handler return since the
+            // server reads them when driving `.file` body delivery. Use the
+            // response's own owned allocator via `ensureOwned` after clone.
+            const owned_path = c.req.allocator.dupe(u8, full_path) catch {
+                c.req.allocator.free(full_path);
+                return response_mod.internalError("static path dupe failed");
+            };
+            c.req.allocator.free(full_path);
+
+            const content_type = static_options.content_type orelse contentTypeForPath(relative_path);
+
+            var built: Response = .{
+                .status = .ok,
+                .content_type = content_type,
+                .body = "",
+                .body_kind = .{ .file = .{
+                    .path = owned_path,
+                    .max_bytes = static_options.max_bytes,
+                    .head_only = c.req.method == .HEAD,
+                    .path_owner = c.req.allocator,
+                } },
             };
             if (static_options.cache_control) |cache_control| {
-                _ = res.header("cache-control", cache_control);
+                _ = built.header("cache-control", cache_control);
             }
-            return res;
+            return built;
         }
     }.run;
+}
+
+fn fileExists(io: std.Io, full_path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, full_path, .{}) catch return false;
+    // Also reject directories so the "index" path gets a shot at serving
+    // `root/index.html`. `access` returns success for directories on most
+    // platforms.
+    var f = std.Io.Dir.cwd().openFile(io, full_path, .{ .allow_directory = false }) catch return false;
+    f.close(io);
+    return true;
 }
 
 fn resolveRelativePath(
@@ -154,7 +196,10 @@ test "serveStatic serves files from the configured root" {
 
     try app.use(serveStatic(.{ .root = "testdata/static" }));
 
-    var res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .GET, "/hello.txt"));
+    // Use `app.request` (not `handle`) because `.file` bodies are only
+    // materialized into `res.body` by the `renderStreamingToBuffered`
+    // path, which `request` invokes and `handle` does not.
+    var res = try app.request(std.testing.allocator, "/hello.txt", .{ .method = .GET });
     defer res.deinit();
 
     try std.testing.expectEqual(std.http.Status.ok, res.status);
@@ -195,13 +240,13 @@ test "serveStatic serves index files and strips body for HEAD" {
 
     try app.use(serveStatic(.{ .root = "testdata/static" }));
 
-    var get_res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .GET, "/"));
+    var get_res = try app.request(std.testing.allocator, "/", .{ .method = .GET });
     defer get_res.deinit();
     try std.testing.expectEqual(std.http.Status.ok, get_res.status);
     try std.testing.expectEqualStrings("text/html; charset=utf-8", get_res.content_type);
     try std.testing.expect(std.mem.indexOf(u8, get_res.body, "zono static index") != null);
 
-    var head_res = app.handle(@import("request.zig").Request.init(std.testing.allocator, .HEAD, "/"));
+    var head_res = try app.request(std.testing.allocator, "/", .{ .method = .HEAD });
     defer head_res.deinit();
     try std.testing.expectEqual(std.http.Status.ok, head_res.status);
     try std.testing.expectEqualStrings("text/html; charset=utf-8", head_res.content_type);

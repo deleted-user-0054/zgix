@@ -69,11 +69,11 @@ Raw snapshot: [benchmarks/latest.json](./benchmarks/latest.json)
 <!-- BENCH:START -->
 | Metric | **zono** | **merjs** | **Hono** | **Next.js** |
 |--------|----------|-----------|----------|-------------|
-| Requests/sec (wrk median) | **89032.39** | **119780.51** | **pending CI** | **1481.82** |
-| Requests/sec (context route) | **85799.98** | - | - | - |
-| Avg latency | **618.07us 347.62us** | **506.93us 710.25us** | **pending CI** | **87.87ms 161.76ms** |
-| Avg latency (context route) | **641.55us 354.18us** | - | - | - |
-| RAM usage (under load) | **53.5 MB** | **3.2 MB** | **pending CI** | **9.6 MB** |
+| Requests/sec (wrk median) | **169497.38** | **95760.33** | **44344.02** | **1528.24** |
+| Requests/sec (context route) | **158955.15** | - | - | - |
+| Avg latency | **335.59us 239.98us** | **623.45us 0.89ms** | **2.25ms 667.05us** | **86.98ms 163.97ms** |
+| Avg latency (context route) | **365.63us 281.30us** | - | - | - |
+| RAM usage (under load) | **56.0 MB** | **3.2 MB** | **52.3 MB** | **9.8 MB** |
 <!-- BENCH:END -->
 
 ## Examples

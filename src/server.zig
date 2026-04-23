@@ -499,7 +499,7 @@ fn sendFileBody(
     var read_buf: [8192]u8 = undefined;
     var file_reader = std.Io.File.Reader.init(file, io, &read_buf);
 
-    const size = file_reader.getSize() catch {
+    const file_size = file_reader.getSize() catch {
         try raw_req.respond("", .{
             .status = .internal_server_error,
             .extra_headers = combined_headers,
@@ -507,7 +507,7 @@ fn sendFileBody(
         return .keep_alive;
     };
 
-    if (size > runtime.max_bytes) {
+    if (file_size > runtime.max_bytes) {
         try raw_req.respond("", .{
             .status = .internal_server_error,
             .extra_headers = combined_headers,
@@ -515,31 +515,38 @@ fn sendFileBody(
         return .keep_alive;
     }
 
+    // Derive the actual byte window to serve. For non-range responses,
+    // `length` is null and we stream [0, file_size). For 206 Partial
+    // Content, the handler has already validated/clamped `offset` and
+    // `length` against `file_size`, so we trust them here.
+    const content_length: u64 = runtime.length orelse (file_size - runtime.offset);
+
     if (runtime.head_only) {
-        // For HEAD, set Content-Length but emit no body. `respond` with an
-        // empty payload and the status header does the right thing; std will
-        // use `""` for the body but we want the header to advertise the real
-        // size. `respondStreaming` + immediate `end()` gives us the right
-        // framing with `content_length = size`.
         var body_writer = try raw_req.respondStreaming(stream_buffer, .{
-            .content_length = size,
+            .content_length = content_length,
             .respond_options = .{
                 .status = response.status,
                 .extra_headers = combined_headers,
             },
         });
-        // Do not write any payload; `end()` will surface a framing error if
-        // `size != 0`. For HEAD we explicitly accept that the keep-alive loop
-        // gets torn down on a sized-but-empty body, so treat end() failure as
-        // a benign close.
         body_writer.end() catch {
             return .upgraded;
         };
         return .keep_alive;
     }
 
+    if (runtime.offset != 0) {
+        file_reader.seekTo(runtime.offset) catch {
+            try raw_req.respond("", .{
+                .status = .internal_server_error,
+                .extra_headers = combined_headers,
+            });
+            return .keep_alive;
+        };
+    }
+
     var body_writer = try raw_req.respondStreaming(stream_buffer, .{
-        .content_length = size,
+        .content_length = content_length,
         .respond_options = .{
             .status = response.status,
             .extra_headers = combined_headers,
@@ -547,9 +554,15 @@ fn sendFileBody(
     });
 
     var aborted = false;
-    _ = file_reader.interface.streamRemaining(&body_writer.writer) catch {
-        aborted = true;
-    };
+    if (runtime.length) |n| {
+        file_reader.interface.streamExact64(&body_writer.writer, n) catch {
+            aborted = true;
+        };
+    } else {
+        _ = file_reader.interface.streamRemaining(&body_writer.writer) catch {
+            aborted = true;
+        };
+    }
     body_writer.end() catch {
         aborted = true;
     };

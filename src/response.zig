@@ -233,6 +233,13 @@ pub const FileRuntime = struct {
     /// should set this so the response owns the string. Constructors that
     /// borrow a caller-owned path should leave it `null`.
     path_owner: ?std.mem.Allocator = null,
+    /// Byte offset within the file where delivery starts. Used by Range
+    /// (206 Partial Content) responses; 0 for full-body delivery.
+    offset: u64 = 0,
+    /// Exact number of bytes to stream. `null` means "from `offset` to EOF
+    /// subject to `max_bytes`" (i.e. full body). Together with `offset`
+    /// this describes the closed byte range to serve.
+    length: ?u64 = null,
 };
 
 /// Discriminates how the response body is delivered. Most code paths produce
@@ -629,17 +636,30 @@ pub const Response = struct {
                 var io_impl = std.Io.Threaded.init_single_threaded;
                 const io = io_impl.io();
 
-                const bytes = std.Io.Dir.cwd().readFileAlloc(io, runtime.path, allocator, .limited(runtime.max_bytes)) catch {
+                const full = std.Io.Dir.cwd().readFileAlloc(io, runtime.path, allocator, .limited(runtime.max_bytes)) catch {
                     const empty = try allocator.dupe(u8, "");
                     return try buildBufferedClone(self, allocator, empty);
                 };
 
-                const payload = if (runtime.head_only) blk: {
-                    allocator.free(bytes);
-                    break :blk try allocator.dupe(u8, "");
-                } else bytes;
+                // Apply the (offset, length) window so Range-partial responses
+                // materialize with the right slice for test inspection.
+                const windowed = blk: {
+                    if (runtime.head_only) {
+                        allocator.free(full);
+                        break :blk try allocator.dupe(u8, "");
+                    }
+                    const start = @min(runtime.offset, full.len);
+                    const end = if (runtime.length) |n|
+                        @min(start +| n, full.len)
+                    else
+                        full.len;
+                    if (start == 0 and end == full.len) break :blk full;
+                    const sliced = try allocator.dupe(u8, full[start..end]);
+                    allocator.free(full);
+                    break :blk sliced;
+                };
 
-                return try buildBufferedClone(self, allocator, payload);
+                return try buildBufferedClone(self, allocator, windowed);
             },
         }
     }

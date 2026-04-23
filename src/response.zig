@@ -89,7 +89,6 @@ pub const WebSocketRuntime = struct {
     ctx: *const anyopaque,
     run_fn: WebSocketRunFn,
     protocol: ?[]const u8 = null,
-    deinit_fn: ?*const fn (allocator: std.mem.Allocator, ctx: *const anyopaque) void = null,
 };
 
 pub const Runtime = union(enum) {
@@ -97,17 +96,175 @@ pub const Runtime = union(enum) {
     websocket: WebSocketRuntime,
 };
 
+/// A streaming-aware writer handed to user code.
+///
+/// `write/writeAll/print/flush` are thin wrappers over the underlying
+/// `std.http.BodyWriter`. `isAborted()` becomes true once the peer is gone or
+/// the server is shutting down, allowing handlers to stop producing data
+/// without surfacing transport errors.
+pub const StreamWriter = struct {
+    /// Underlying writer. In production this is `&body_writer.writer` from a
+    /// `std.http.BodyWriter` returned by `respondStreaming` (so chunked /
+    /// content-length framing is handled by the writer's vtable). In tests
+    /// `App.request` substitutes an in-memory `std.Io.Writer.Allocating`.
+    inner: *std.Io.Writer,
+    aborted: *const bool,
+
+    pub const Error = std.Io.Writer.Error;
+
+    pub fn writer(self: *StreamWriter) *std.Io.Writer {
+        return self.inner;
+    }
+
+    pub fn writeAll(self: *StreamWriter, bytes: []const u8) Error!void {
+        try self.inner.writeAll(bytes);
+    }
+
+    pub fn write(self: *StreamWriter, bytes: []const u8) Error!usize {
+        return try self.inner.write(bytes);
+    }
+
+    pub fn print(self: *StreamWriter, comptime fmt: []const u8, args: anytype) Error!void {
+        try self.inner.print(fmt, args);
+    }
+
+    /// Flushes buffered bytes onto the wire so the client receives them now.
+    pub fn flush(self: *StreamWriter) Error!void {
+        try self.inner.flush();
+    }
+
+    /// True once the connection is no longer usable (peer closed, server
+    /// shutdown, etc). Stream handlers should poll this between chunks.
+    pub fn isAborted(self: *const StreamWriter) bool {
+        return self.aborted.*;
+    }
+};
+
+pub const StreamRunFn = *const fn (ctx: *const anyopaque, stream: *StreamWriter) anyerror!void;
+
+pub const StreamRuntime = struct {
+    ctx: *const anyopaque,
+    run_fn: StreamRunFn,
+    /// Optional content length. When null, transfer-encoding: chunked is used.
+    content_length: ?u64 = null,
+};
+
+/// Server-Sent Events runtime. Specialization of streaming for the
+/// `text/event-stream` content type that frames messages for the user.
+pub const SseEvent = struct {
+    event: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    retry_ms: ?u64 = null,
+    data: []const u8 = "",
+};
+
+pub const SseWriter = struct {
+    stream: *StreamWriter,
+
+    pub const Error = StreamWriter.Error;
+
+    pub fn isAborted(self: *const SseWriter) bool {
+        return self.stream.isAborted();
+    }
+
+    pub fn flush(self: *SseWriter) Error!void {
+        try self.stream.flush();
+    }
+
+    /// Sends a comment line. Useful as a keep-alive when no real data is due.
+    pub fn comment(self: *SseWriter, text_value: []const u8) Error!void {
+        try writeMultiline(self.stream, ": ", text_value);
+        try self.stream.writeAll("\n");
+    }
+
+    pub fn send(self: *SseWriter, event: SseEvent) Error!void {
+        if (event.id) |id| {
+            try self.stream.writeAll("id: ");
+            try self.stream.writeAll(id);
+            try self.stream.writeAll("\n");
+        }
+        if (event.event) |name| {
+            try self.stream.writeAll("event: ");
+            try self.stream.writeAll(name);
+            try self.stream.writeAll("\n");
+        }
+        if (event.retry_ms) |retry| {
+            try self.stream.print("retry: {d}\n", .{retry});
+        }
+        if (event.data.len > 0) {
+            try writeMultiline(self.stream, "data: ", event.data);
+        }
+        try self.stream.writeAll("\n");
+    }
+
+    fn writeMultiline(sw: *StreamWriter, prefix: []const u8, value: []const u8) Error!void {
+        var iter = std.mem.splitScalar(u8, value, '\n');
+        while (iter.next()) |line| {
+            try sw.writeAll(prefix);
+            try sw.writeAll(line);
+            try sw.writeAll("\n");
+        }
+    }
+};
+
+pub const SseRunFn = *const fn (ctx: *const anyopaque, sse: *SseWriter) anyerror!void;
+
+pub const SseRuntime = struct {
+    ctx: *const anyopaque,
+    run_fn: SseRunFn,
+};
+
+/// Discriminates how the response body is delivered. Most code paths produce
+/// `.buffered`, but `.stream`/`.sse` allow chunked/streaming output and
+/// `.sendfile` will (PR4) hand off to zero-copy file delivery.
+pub const Body = union(enum) {
+    buffered: []const u8,
+    stream: StreamRuntime,
+    sse: SseRuntime,
+};
+
+/// Linked list node describing a heap-allocated "scope" whose lifetime is
+/// tied to a `Response`. The framework uses this so that streaming
+/// responses can keep their handler context (and any wrapping middleware
+/// contexts) alive across the boundary between the handler returning and
+/// the body actually being produced. See `Response.attachScope`.
+pub const ScopeNode = struct {
+    /// Allocator that backs `self` (the node itself). Other heap state
+    /// owned by the scope is freed by `deinit_fn`.
+    allocator: std.mem.Allocator,
+    /// User pointer, type-erased.
+    ptr: *anyopaque,
+    /// Frees `ptr`. Called once when the response (or a transferred
+    /// successor) is deinit'd. Must NOT free the `ScopeNode` itself.
+    deinit_fn: *const fn (scope: *anyopaque) void,
+    /// Next scope further out in attach order; freed after this one.
+    next: ?*ScopeNode = null,
+};
+
 pub const Response = struct {
     status: std.http.Status,
     content_type: []const u8,
+    /// Buffered body bytes. Kept as a top-level field for backwards
+    /// compatibility; for streaming responses this stays empty and `body_kind`
+    /// drives delivery instead.
     body: []const u8,
+    body_kind: Body = .{ .buffered = "" },
     location: ?[]const u8 = null,
     allow: ?[]const u8 = null,
     extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty,
     extra_headers_allocator: ?std.mem.Allocator = null,
     owned_allocator: ?std.mem.Allocator = null,
     runtime: Runtime = .none,
-    runtime_allocator: ?std.mem.Allocator = null,
+    /// Optional chain of scopes whose lifetime is tied to this Response.
+    /// Used by the framework to keep things like a heap-allocated `Context`
+    /// (with its `SharedState` and route params) alive across the boundary
+    /// between the outer handler returning and the streaming body actually
+    /// being produced. Stored as a linked list so nested wrappers can each
+    /// attach their own scope without disturbing inner ones. Freed in
+    /// `deinit` in attach order (newest first). This is the single, uniform
+    /// ownership-extension slot — works for any body kind (`.buffered`,
+    /// `.stream`, `.sse`) and any runtime (`.websocket`, etc.).
+    scope_head: ?*ScopeNode = null,
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
@@ -147,6 +304,7 @@ pub const Response = struct {
 
     pub fn setBody(self: *Response, content: []const u8) bool {
         self.replaceSlice(&self.body, content) catch return false;
+        self.body_kind = .{ .buffered = self.body };
         return true;
     }
 
@@ -277,6 +435,10 @@ pub const Response = struct {
 
     pub fn clone(self: Response, allocator: std.mem.Allocator) !Response {
         if (self.runtime != .none) return error.UnsupportedRuntimeClone;
+        switch (self.body_kind) {
+            .buffered => {},
+            .stream, .sse => return error.UnsupportedRuntimeClone,
+        }
 
         var cloned: Response = .{
             .status = self.status,
@@ -296,14 +458,75 @@ pub const Response = struct {
             });
         }
 
+        cloned.body_kind = .{ .buffered = cloned.body };
         return cloned;
     }
 
-    pub fn deinit(self: *Response) void {
-        if (self.runtime_allocator) |allocator| switch (self.runtime) {
-            .websocket => |runtime| if (runtime.deinit_fn) |deinit_fn| deinit_fn(allocator, runtime.ctx),
-            .none => {},
+    /// Attaches an opaque "scope" whose lifetime is tied to this Response.
+    /// `scope_deinit` is invoked exactly once when the Response is `deinit`ed
+    /// (or transferred to a successor Response that itself is deinit'd).
+    ///
+    /// Multiple scopes may be attached (e.g. nested middleware): they form
+    /// a linked list and are freed in reverse-attach order on `deinit`. The
+    /// `node_allocator` is used to allocate the bookkeeping `ScopeNode` and
+    /// is also used to free that node on deinit.
+    pub fn attachScope(
+        self: *Response,
+        node_allocator: std.mem.Allocator,
+        scope_ptr: *anyopaque,
+        scope_deinit: *const fn (scope: *anyopaque) void,
+    ) std.mem.Allocator.Error!void {
+        const node = try node_allocator.create(ScopeNode);
+        node.* = .{
+            .allocator = node_allocator,
+            .ptr = scope_ptr,
+            .deinit_fn = scope_deinit,
+            .next = self.scope_head,
         };
+        self.scope_head = node;
+    }
+
+    /// Single, uniform ownership-finalization for scopes whose lifetime
+    /// must extend until the Response is fully delivered. The framework
+    /// calls this after a user handler returns, for both buffered and
+    /// streaming bodies — the scope is either attached to the response
+    /// (so it lives until delivery completes) or freed immediately.
+    ///
+    /// On attach failure for a streaming body the scope is freed and the
+    /// response is replaced with an internal-error response, because we
+    /// cannot let the streaming callback fire against a dangling scope.
+    pub fn finalizeScope(
+        self: *Response,
+        node_allocator: std.mem.Allocator,
+        scope_ptr: *anyopaque,
+        scope_deinit: *const fn (scope: *anyopaque) void,
+    ) void {
+        const needs_extension = switch (self.body_kind) {
+            .stream, .sse => true,
+            .buffered => self.runtime != .none, // websocket etc. also need extension
+        };
+
+        if (!needs_extension) {
+            scope_deinit(scope_ptr);
+            return;
+        }
+
+        self.attachScope(node_allocator, scope_ptr, scope_deinit) catch {
+            scope_deinit(scope_ptr);
+            self.deinit();
+            self.* = internalError("scope attach failed");
+        };
+    }
+
+    pub fn deinit(self: *Response) void {
+        var scope_iter = self.scope_head;
+        self.scope_head = null;
+        while (scope_iter) |node| {
+            const next = node.next;
+            node.deinit_fn(node.ptr);
+            node.allocator.destroy(node);
+            scope_iter = next;
+        }
 
         if (self.owned_allocator) |allocator| {
             allocator.free(self.content_type);
@@ -323,7 +546,81 @@ pub const Response = struct {
         self.extra_headers_allocator = null;
         self.owned_allocator = null;
         self.runtime = .none;
-        self.runtime_allocator = null;
+        self.body_kind = .{ .buffered = "" };
+    }
+
+    /// Renders a streaming (`.stream` / `.sse`) response into an owned buffered
+    /// `Response` by running the user handler against an in-memory writer.
+    /// Used by `App.request` so tests can inspect streaming handlers without
+    /// going through the network. For `.buffered` bodies, behaves like `clone`.
+    /// On return, the original `self` retains ownership of its runtime context.
+    pub fn renderStreamingToBuffered(
+        self: *const Response,
+        allocator: std.mem.Allocator,
+    ) !Response {
+        switch (self.body_kind) {
+            .buffered => return try self.clone(allocator),
+            .stream => |runtime| {
+                var aw: std.Io.Writer.Allocating = .init(allocator);
+                errdefer aw.deinit();
+                var aborted: bool = false;
+                var sw = StreamWriter{
+                    .inner = &aw.writer,
+                    .aborted = &aborted,
+                };
+                try runtime.run_fn(runtime.ctx, &sw);
+                try aw.writer.flush();
+                const bytes = try aw.toOwnedSlice();
+                return try buildBufferedClone(self, allocator, bytes);
+            },
+            .sse => |runtime| {
+                var aw: std.Io.Writer.Allocating = .init(allocator);
+                errdefer aw.deinit();
+                var aborted: bool = false;
+                var sw = StreamWriter{
+                    .inner = &aw.writer,
+                    .aborted = &aborted,
+                };
+                var sse_writer = SseWriter{ .stream = &sw };
+                try runtime.run_fn(runtime.ctx, &sse_writer);
+                try aw.writer.flush();
+                const bytes = try aw.toOwnedSlice();
+                return try buildBufferedClone(self, allocator, bytes);
+            },
+        }
+    }
+
+    /// Builds an owned buffered `Response` carrying `body_bytes` (already
+    /// allocator-owned). Headers/content-type/location/allow are duped from
+    /// `source`. Takes ownership of `body_bytes` on success; frees on error.
+    fn buildBufferedClone(
+        source: *const Response,
+        allocator: std.mem.Allocator,
+        body_bytes: []u8,
+    ) !Response {
+        errdefer allocator.free(body_bytes);
+
+        var cloned: Response = .{
+            .status = source.status,
+            .content_type = try allocator.dupe(u8, source.content_type),
+            .body = body_bytes,
+            .location = if (source.location) |location| try allocator.dupe(u8, location) else null,
+            .allow = if (source.allow) |allow| try allocator.dupe(u8, allow) else null,
+            .extra_headers_allocator = allocator,
+            .owned_allocator = allocator,
+        };
+        errdefer cloned.deinit();
+
+        cloned.body_kind = .{ .buffered = cloned.body };
+
+        for (source.extra_headers.items) |extra_header| {
+            try cloned.extra_headers.append(allocator, .{
+                .name = try allocator.dupe(u8, extra_header.name),
+                .value = try allocator.dupe(u8, extra_header.value),
+            });
+        }
+
+        return cloned;
     }
 
     pub fn ensureOwned(self: *Response, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
@@ -369,6 +666,7 @@ pub const Response = struct {
         self.extra_headers = owned_headers;
         self.extra_headers_allocator = allocator;
         self.owned_allocator = allocator;
+        if (self.body_kind == .buffered) self.body_kind = .{ .buffered = self.body };
     }
 
     fn replaceSlice(self: *Response, field: *[]const u8, value: []const u8) std.mem.Allocator.Error!void {
@@ -564,6 +862,28 @@ pub fn websocketRuntime(runtime: WebSocketRuntime) Response {
         .content_type = "",
         .body = "",
         .runtime = .{ .websocket = runtime },
+    };
+}
+
+/// Build a streaming response. Pass an explicit `content_length` if you know
+/// the body size up front; otherwise the server will use chunked encoding.
+pub fn stream(content_type: []const u8, runtime: StreamRuntime) Response {
+    return .{
+        .status = .ok,
+        .content_type = content_type,
+        .body = "",
+        .body_kind = .{ .stream = runtime },
+    };
+}
+
+/// Build a Server-Sent Events response. Sets `text/event-stream` and arranges
+/// for chunked delivery of framed events.
+pub fn sse(runtime: SseRuntime) Response {
+    return .{
+        .status = .ok,
+        .content_type = "text/event-stream; charset=utf-8",
+        .body = "",
+        .body_kind = .{ .sse = runtime },
     };
 }
 

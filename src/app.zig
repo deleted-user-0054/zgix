@@ -310,24 +310,45 @@ pub const App = struct {
         }
 
         var handled_req = req;
-        var shared_state = context_mod.SharedState.init(handled_req.allocator);
         const owns_context_state = handled_req.context_state == null;
-        const state: *context_mod.SharedState = if (owns_context_state) blk: {
-            handled_req.context_state = @ptrCast(&shared_state);
-            break :blk &shared_state;
-        } else @ptrCast(@alignCast(handled_req.context_state.?));
+
+        // When this App is the first to introduce shared state, allocate it
+        // via the same uniform `SharedStateScope` that the wrapper family
+        // uses, so that streaming responses can extend its lifetime through
+        // `Response.finalizeScope`. For inherited state, the caller already
+        // owns it and we must not free it.
+        const owned_state_scope: ?*context_mod.SharedStateScope = if (owns_context_state) blk: {
+            const s = context_mod.SharedStateScope.create(handled_req.allocator) catch
+                return response_mod.internalError("context alloc failed");
+            handled_req.context_state = @ptrCast(s.state);
+            break :blk s;
+        } else null;
+
+        const state: *context_mod.SharedState = @ptrCast(@alignCast(handled_req.context_state.?));
         const previous_not_found_handler = state.not_found_handler;
         const previous_on_error_handler = state.on_error_handler;
         state.not_found_handler = self.not_found_handler;
         state.on_error_handler = self.on_error_handler;
-        defer state.not_found_handler = previous_not_found_handler;
-        defer state.on_error_handler = previous_on_error_handler;
-        defer if (owns_context_state) shared_state.deinit();
 
-        return if (self.middlewares.items.len == 0)
+        var response = if (self.middlewares.items.len == 0)
             self.handleEndpoint(handled_req)
         else
             self.runMiddlewares(handled_req, 0);
+
+        if (owned_state_scope) |s| {
+            response.finalizeScope(
+                handled_req.allocator,
+                @ptrCast(s),
+                context_mod.SharedStateScope.deinitOpaque,
+            );
+        } else {
+            // Inherited state — restore handler slots we mutated above so
+            // the caller observes no side effects.
+            state.on_error_handler = previous_on_error_handler;
+            state.not_found_handler = previous_not_found_handler;
+        }
+
+        return response;
     }
 
     fn runMiddlewares(self: *App, req: Request, start_index: usize) Response {
@@ -477,13 +498,23 @@ pub const App = struct {
 
         var response = self.handle(req);
         defer response.deinit();
-        return try response.clone(allocator);
+        return try materializeResponse(allocator, &response);
     }
 
     fn cloneHandledResponse(self: *App, allocator: std.mem.Allocator, req: Request) !Response {
         var response = self.handle(req);
         defer response.deinit();
-        return try response.clone(allocator);
+        return try materializeResponse(allocator, &response);
+    }
+
+    /// Renders a handled response into an owned, buffered `Response` suitable
+    /// for inspection by tests or programmatic callers. Streaming bodies are
+    /// drained into memory via `renderStreamingToBuffered`.
+    fn materializeResponse(allocator: std.mem.Allocator, response: *response_mod.Response) !Response {
+        return switch (response.body_kind) {
+            .buffered => try response.clone(allocator),
+            .stream, .sse => try response.renderStreamingToBuffered(allocator),
+        };
     }
 
     fn registerOn(self: *App, methods: anytype, paths: anytype, handler: anytype) !void {
@@ -962,17 +993,65 @@ fn returnsErrorResponse(comptime return_type: ?type, comptime owner: []const u8)
     };
 }
 
+/// Per-handler/middleware scope bundle. Always carries a `ContextScope`
+/// (the heap `Context` + duped params). When this wrapper is the first to
+/// introduce `SharedState` (i.e. nothing in the outer chain provided
+/// one), it also carries a `SharedStateScope` that owns that state. The
+/// two scopes are attached to the response in order so that on deinit the
+/// `Context` is freed before the `SharedState` it borrows from.
+const HandlerScope = struct {
+    state_scope: ?*context_mod.SharedStateScope,
+    ctx_scope: *context_mod.ContextScope,
+};
+
+/// Heap-allocates the scope bundle for a context-aware handler. If the
+/// inbound request already has a `context_state`, the scope inherits it;
+/// otherwise a fresh `SharedState` is owned by `state_scope`. Returns
+/// `null` on allocation failure.
+fn createHandlerScope(req: Request) ?HandlerScope {
+    const inherited_state: ?*context_mod.SharedState = if (req.context_state) |raw|
+        @ptrCast(@alignCast(raw))
+    else
+        null;
+
+    var owned_state_scope: ?*context_mod.SharedStateScope = null;
+    if (inherited_state == null) {
+        owned_state_scope = context_mod.SharedStateScope.create(req.allocator) catch return null;
+    }
+    errdefer if (owned_state_scope) |s| s.deinit();
+
+    const state = inherited_state orelse owned_state_scope.?.state;
+
+    const ctx_scope = context_mod.ContextScope.create(req.allocator, req, state) catch {
+        if (owned_state_scope) |s| s.deinit();
+        return null;
+    };
+
+    return .{ .state_scope = owned_state_scope, .ctx_scope = ctx_scope };
+}
+
+/// Finalizes a `HandlerScope` after the user handler returns: each scope
+/// is either attached to the response (extending its lifetime past this
+/// frame) or freed immediately, via `Response.finalizeScope`.
+///
+/// Attach order matters: the state scope goes on first so that on deinit
+/// the `Context` (which borrows the state) is freed before the state.
+fn finalizeHandlerScope(scope: HandlerScope, response: *Response) void {
+    const allocator = scope.ctx_scope.allocator;
+    if (scope.state_scope) |s| {
+        response.finalizeScope(allocator, @ptrCast(s), context_mod.SharedStateScope.deinitOpaque);
+    }
+    response.finalizeScope(allocator, @ptrCast(scope.ctx_scope), context_mod.ContextScope.deinitOpaque);
+}
+
 fn wrapContextHandler(comptime target: anytype) Handler {
     return struct {
         fn run(req: Request) Response {
-            var local_state = context_mod.SharedState.init(req.allocator);
-            var ctx_req = req;
-            const owns_context_state = ctx_req.context_state == null;
-            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
-            defer if (owns_context_state) local_state.deinit();
-
-            var ctx = Context.init(ctx_req);
-            return target(&ctx);
+            const scope = createHandlerScope(req) orelse
+                return response_mod.internalError("context alloc failed");
+            var response = target(scope.ctx_scope.ctx);
+            finalizeHandlerScope(scope, &response);
+            return response;
         }
     }.run;
 }
@@ -980,14 +1059,11 @@ fn wrapContextHandler(comptime target: anytype) Handler {
 fn wrapContextErrorHandler(comptime target: anytype) Handler {
     return struct {
         fn run(req: Request) Response {
-            var local_state = context_mod.SharedState.init(req.allocator);
-            var ctx_req = req;
-            const owns_context_state = ctx_req.context_state == null;
-            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
-            defer if (owns_context_state) local_state.deinit();
-
-            var ctx = Context.init(ctx_req);
-            return target(&ctx) catch |err| dispatchHandlerError(ctx_req, err);
+            const scope = createHandlerScope(req) orelse
+                return response_mod.internalError("context alloc failed");
+            var response = target(scope.ctx_scope.ctx) catch |err| dispatchHandlerError(scope.ctx_scope.ctx.req, err);
+            finalizeHandlerScope(scope, &response);
+            return response;
         }
     }.run;
 }
@@ -995,18 +1071,15 @@ fn wrapContextErrorHandler(comptime target: anytype) Handler {
 fn wrapContextMiddleware(comptime target: anytype) App.DispatchMiddleware {
     return struct {
         fn run(req: Request, next: App.DispatchNext) Response {
-            var local_state = context_mod.SharedState.init(req.allocator);
-            var ctx_req = req;
-            const owns_context_state = ctx_req.context_state == null;
-            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
-            defer if (owns_context_state) local_state.deinit();
-
-            var ctx = Context.init(ctx_req);
-            return target(&ctx, .{
-                .ctx = &ctx,
+            const scope = createHandlerScope(req) orelse
+                return response_mod.internalError("context alloc failed");
+            var response = target(scope.ctx_scope.ctx, .{
+                .ctx = scope.ctx_scope.ctx,
                 .next_ctx = &next,
                 .run_fn = runContextMiddlewareNext,
             });
+            finalizeHandlerScope(scope, &response);
+            return response;
         }
     }.run;
 }
@@ -1014,18 +1087,15 @@ fn wrapContextMiddleware(comptime target: anytype) App.DispatchMiddleware {
 fn wrapContextErrorMiddleware(comptime target: anytype) App.DispatchMiddleware {
     return struct {
         fn run(req: Request, next: App.DispatchNext) Response {
-            var local_state = context_mod.SharedState.init(req.allocator);
-            var ctx_req = req;
-            const owns_context_state = ctx_req.context_state == null;
-            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
-            defer if (owns_context_state) local_state.deinit();
-
-            var ctx = Context.init(ctx_req);
-            return target(&ctx, .{
-                .ctx = &ctx,
+            const scope = createHandlerScope(req) orelse
+                return response_mod.internalError("context alloc failed");
+            var response = target(scope.ctx_scope.ctx, .{
+                .ctx = scope.ctx_scope.ctx,
                 .next_ctx = &next,
                 .run_fn = runContextMiddlewareNext,
-            }) catch |err| dispatchHandlerError(ctx_req, err);
+            }) catch |err| dispatchHandlerError(scope.ctx_scope.ctx.req, err);
+            finalizeHandlerScope(scope, &response);
+            return response;
         }
     }.run;
 }
@@ -1033,19 +1103,13 @@ fn wrapContextErrorMiddleware(comptime target: anytype) App.DispatchMiddleware {
 fn wrapContextErrorResponder(comptime target: anytype) ErrorHandler {
     return struct {
         fn run(err: anyerror, req: Request) Response {
-            var local_state = context_mod.SharedState.init(req.allocator);
-            var ctx_req = req;
-            const owns_context_state = ctx_req.context_state == null;
-            if (owns_context_state) ctx_req.context_state = @ptrCast(&local_state);
-            defer if (owns_context_state) local_state.deinit();
-
-            if (ctx_req.context_state) |raw_state| {
-                const state: *context_mod.SharedState = @ptrCast(@alignCast(raw_state));
-                state.last_error = err;
-            }
-
-            var ctx = Context.init(ctx_req);
-            return target(err, &ctx);
+            const scope = createHandlerScope(req) orelse
+                return response_mod.internalError("context alloc failed");
+            scope.ctx_scope.ctx.state.last_error = err;
+            scope.ctx_scope.ctx.err = err;
+            var response = target(err, scope.ctx_scope.ctx);
+            finalizeHandlerScope(scope, &response);
+            return response;
         }
     }.run;
 }
@@ -1657,6 +1721,108 @@ test "app request helper rejects websocket upgrade responses" {
     }));
 }
 
+test "app request helper renders chunked stream handler into buffered body" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/stream", struct {
+        fn run(c: *Context) Response {
+            return c.stream("text/plain", struct {
+                fn write(w: *response_mod.StreamWriter) !void {
+                    try w.writeAll("hello ");
+                    try w.writeAll("world");
+                }
+            }.write, .{});
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/stream", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("text/plain", res.content_type);
+    try std.testing.expectEqualStrings("hello world", res.body);
+    try std.testing.expect(res.body_kind == .buffered);
+}
+
+test "app request helper supports content-length stream variant" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/sized", struct {
+        fn run(c: *Context) Response {
+            return c.stream("application/octet-stream", struct {
+                fn write(w: *response_mod.StreamWriter) !void {
+                    try w.writeAll("12345");
+                }
+            }.write, .{ .content_length = 5 });
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/sized", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("12345", res.body);
+}
+
+test "app request helper renders sse handler with multi-line data" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/events", struct {
+        fn run(c: *Context) Response {
+            return c.sse(struct {
+                fn write(w: *response_mod.SseWriter) !void {
+                    try w.send(.{ .event = "tick", .id = "1", .data = "first" });
+                    try w.send(.{ .data = "line1\nline2" });
+                }
+            }.write);
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/events", .{});
+    defer res.deinit();
+
+    try std.testing.expect(std.mem.startsWith(u8, res.content_type, "text/event-stream"));
+
+    var saw_cache_header = false;
+    var saw_accel_header = false;
+    for (res.extraHeaders()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "cache-control") and
+            std.mem.eql(u8, h.value, "no-cache")) saw_cache_header = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "x-accel-buffering") and
+            std.mem.eql(u8, h.value, "no")) saw_accel_header = true;
+    }
+    try std.testing.expect(saw_cache_header);
+    try std.testing.expect(saw_accel_header);
+
+    const expected =
+        "id: 1\nevent: tick\ndata: first\n\n" ++
+        "data: line1\ndata: line2\n\n";
+    try std.testing.expectEqualStrings(expected, res.body);
+}
+
+test "app request helper passes context to two-arg stream handler" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/greet/:name", struct {
+        fn run(c: *Context) Response {
+            return c.stream("text/plain", struct {
+                fn write(ctx: *Context, w: *response_mod.StreamWriter) !void {
+                    const name = ctx.req.param("name") orelse "world";
+                    try w.print("hi {s}", .{name});
+                }
+            }.write, .{});
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/greet/zig", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("hi zig", res.body);
+}
+
 test "app showRoutes lists middleware mounts and routes" {
     var app = App.init(std.testing.allocator);
     defer app.deinit();
@@ -1702,4 +1868,66 @@ test "app fetch aliases handle" {
     const res = app.fetch(Request.init(arena.allocator(), .GET, "/health"));
     try std.testing.expectEqual(std.http.Status.ok, res.status);
     try std.testing.expectEqualStrings("ok", res.body);
+}
+
+// Regression: prior to the StreamingScope refactor, a streaming handler's
+// captured Context was a detached snapshot — values written via
+// `c.set` in outer middleware were invisible inside the streaming
+// callback (the API silently lied). With heap-allocated context state
+// transferred to the response on streaming, the inner callback now sees
+// the same SharedState as the outer middleware that ran it.
+test "streaming with_context inherits outer middleware shared state" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.set("user", @as([]const u8, "alice")) catch
+                return response_mod.internalError("set failed");
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+
+    try app.get("/who", struct {
+        fn run(c: *Context) Response {
+            return c.stream("text/plain", struct {
+                fn write(ctx: *Context, w: *response_mod.StreamWriter) !void {
+                    const user = ctx.get([]const u8, "user") orelse "anonymous";
+                    try w.print("hello {s}", .{user});
+                }
+            }.write, .{});
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/who", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("hello alice", res.body);
+}
+
+// Regression: route params previously had to be duped inside the stream
+// adapter because the router freed `params_storage` after the outer
+// handler returned. With StreamingScope owning a duped copy installed on
+// `req.params` from the start, params remain valid during streaming
+// without per-adapter dupe logic.
+test "streaming with_context can read route params after outer return" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/items/:id", struct {
+        fn run(c: *Context) Response {
+            return c.stream("text/plain", struct {
+                fn write(ctx: *Context, w: *response_mod.StreamWriter) !void {
+                    const id = ctx.req.param("id") orelse "?";
+                    try w.print("item={s}", .{id});
+                }
+            }.write, .{});
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/items/42", .{});
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("item=42", res.body);
 }

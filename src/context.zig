@@ -177,6 +177,29 @@ pub const Context = struct {
         return websocket_mod.upgradeWebSocket(self.req, handler, options);
     }
 
+    /// Build a streaming (chunked or content-length) response. The handler is
+    /// called once headers are flushed, with a writer that surfaces aborts via
+    /// `StreamWriter.isAborted()`.
+    ///
+    /// The `handler` may be `fn(*StreamWriter) !void` or
+    /// `fn(*Context, *StreamWriter) !void`. Captures are not supported; pass
+    /// state through `Context.set/get` if needed.
+    pub fn stream(
+        self: *Context,
+        content_type: []const u8,
+        comptime handler: anytype,
+        options: StreamOptions,
+    ) Response {
+        return buildStreamResponse(self, content_type, handler, options);
+    }
+
+    /// Build a Server-Sent Events response. Sets the appropriate
+    /// `text/event-stream` content type and disables buffering caches by
+    /// default.
+    pub fn sse(self: *Context, comptime handler: anytype) Response {
+        return buildSseResponse(self, handler);
+    }
+
     pub fn cookie(
         self: *Context,
         name: []const u8,
@@ -235,6 +258,189 @@ pub const Context = struct {
         self.res = &self.state.response;
     }
 };
+
+pub const StreamOptions = struct {
+    /// When known, the precise body length so the response can use
+    /// content-length instead of chunked encoding.
+    content_length: ?u64 = null,
+};
+
+/// Heap-owned `SharedState`. Used by `App.handle` (and any wrapper that
+/// is the first to introduce `SharedState`) so that streaming responses
+/// can extend the state's lifetime past the wrapper's stack frame via
+/// `Response.attachScope`. Single responsibility: own the `SharedState`
+/// and free it (and the bookkeeping wrapper) on deinit.
+pub const SharedStateScope = struct {
+    allocator: std.mem.Allocator,
+    state: *SharedState,
+
+    pub fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*SharedStateScope {
+        const scope = try allocator.create(SharedStateScope);
+        errdefer allocator.destroy(scope);
+        const state = try allocator.create(SharedState);
+        state.* = SharedState.init(allocator);
+        scope.* = .{ .allocator = allocator, .state = state };
+        return scope;
+    }
+
+    pub fn deinit(self: *SharedStateScope) void {
+        const allocator = self.allocator;
+        self.state.deinit();
+        allocator.destroy(self.state);
+        allocator.destroy(self);
+    }
+
+    pub fn deinitOpaque(scope_ptr: *anyopaque) void {
+        const self: *SharedStateScope = @ptrCast(@alignCast(scope_ptr));
+        self.deinit();
+    }
+};
+
+/// Heap-owned `Context` plus a duped copy of route params. Borrows the
+/// `SharedState` pointer (lifetime is guaranteed by either an inherited
+/// outer scope or a sibling `SharedStateScope` attached to the same
+/// `Response`). Created by the `wrapContext*` family on entry to each
+/// context-aware handler/middleware so that streaming callbacks fired
+/// after the wrapper returns still see a valid `*Context`, route params,
+/// and `SharedState`.
+///
+/// The router's `params_storage` is freed shortly after the outer handler
+/// returns, so we always dupe params even when state ownership is
+/// inherited.
+pub const ContextScope = struct {
+    allocator: std.mem.Allocator,
+    ctx: *Context,
+    params: []request_mod.Param,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        req: Request,
+        state: *SharedState,
+    ) std.mem.Allocator.Error!*ContextScope {
+        const scope = try allocator.create(ContextScope);
+        errdefer allocator.destroy(scope);
+
+        const owned_params = try allocator.dupe(request_mod.Param, req.params);
+        errdefer allocator.free(owned_params);
+
+        const ctx_ptr = try allocator.create(Context);
+        errdefer allocator.destroy(ctx_ptr);
+
+        var scoped_req = req;
+        scoped_req.params = owned_params;
+        scoped_req.context_state = @ptrCast(state);
+        ctx_ptr.* = Context.init(scoped_req);
+
+        scope.* = .{ .allocator = allocator, .ctx = ctx_ptr, .params = owned_params };
+        return scope;
+    }
+
+    pub fn deinit(self: *ContextScope) void {
+        const allocator = self.allocator;
+        allocator.destroy(self.ctx);
+        allocator.free(self.params);
+        allocator.destroy(self);
+    }
+
+    pub fn deinitOpaque(scope_ptr: *anyopaque) void {
+        const self: *ContextScope = @ptrCast(@alignCast(scope_ptr));
+        self.deinit();
+    }
+};
+
+fn buildStreamResponse(
+    self: *Context,
+    content_type: []const u8,
+    comptime handler: anytype,
+    options: StreamOptions,
+) Response {
+    const Adapter = streamAdapter(@TypeOf(handler), handler);
+
+    return response_mod.stream(content_type, .{
+        .ctx = @ptrCast(self),
+        .run_fn = Adapter.run,
+        .content_length = options.content_length,
+    });
+}
+
+fn buildSseResponse(self: *Context, comptime handler: anytype) Response {
+    const Adapter = sseAdapter(@TypeOf(handler), handler);
+
+    var response = response_mod.sse(.{
+        .ctx = @ptrCast(self),
+        .run_fn = Adapter.run,
+    });
+    // Disable proxy buffering (nginx etc.) so events arrive promptly.
+    _ = response.appendHeader("cache-control", "no-cache");
+    _ = response.appendHeader("x-accel-buffering", "no");
+    return response;
+}
+
+const StreamHandlerKind = enum { writer_only, with_context };
+
+fn classifyStreamHandler(comptime HandlerType: type, comptime SecondParam: type) StreamHandlerKind {
+    const info = streamHandlerFnInfo(HandlerType);
+    return switch (info.params.len) {
+        1 => blk: {
+            const P0 = info.params[0].type orelse @compileError("stream handler params must be concrete types");
+            if (P0 != SecondParam) @compileError("single-arg stream handler must take *StreamWriter or *SseWriter");
+            break :blk .writer_only;
+        },
+        2 => blk: {
+            const P0 = info.params[0].type orelse @compileError("stream handler params must be concrete types");
+            const P1 = info.params[1].type orelse @compileError("stream handler params must be concrete types");
+            if (P0 != *Context or P1 != SecondParam) @compileError("two-arg stream handler must be fn(*Context, writer) !void");
+            break :blk .with_context;
+        },
+        else => @compileError("stream handler must take 1 or 2 args"),
+    };
+}
+
+fn streamHandlerFnInfo(comptime HandlerType: type) std.builtin.Type.Fn {
+    return switch (@typeInfo(HandlerType)) {
+        .@"fn" => |f| f,
+        .pointer => |p| switch (@typeInfo(p.child)) {
+            .@"fn" => |f| f,
+            else => @compileError("stream handler must be a function"),
+        },
+        else => @compileError("stream handler must be a function"),
+    };
+}
+
+fn streamAdapter(comptime HandlerType: type, comptime handler: anytype) type {
+    const kind = classifyStreamHandler(HandlerType, *response_mod.StreamWriter);
+    return struct {
+        // The Adapter is intentionally trivial: it just relays the heap-
+        // allocated `*Context` (already kept alive by `StreamingScope` on
+        // the outer `Response`) into the user's callback. No per-adapter
+        // allocation/dupe is required — the `wrapContextHandler` family
+        // owns lifetime management above us.
+        fn run(ctx: *const anyopaque, writer: *response_mod.StreamWriter) anyerror!void {
+            switch (kind) {
+                .writer_only => try handler(writer),
+                .with_context => {
+                    const c: *Context = @ptrCast(@alignCast(@constCast(ctx)));
+                    try handler(c, writer);
+                },
+            }
+        }
+    };
+}
+
+fn sseAdapter(comptime HandlerType: type, comptime handler: anytype) type {
+    const kind = classifyStreamHandler(HandlerType, *response_mod.SseWriter);
+    return struct {
+        fn run(ctx: *const anyopaque, writer: *response_mod.SseWriter) anyerror!void {
+            switch (kind) {
+                .writer_only => try handler(writer),
+                .with_context => {
+                    const c: *Context = @ptrCast(@alignCast(@constCast(ctx)));
+                    try handler(c, writer);
+                },
+            }
+        }
+    };
+}
 
 fn putVariableValue(
     allocator: std.mem.Allocator,

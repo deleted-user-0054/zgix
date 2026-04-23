@@ -10,6 +10,9 @@ pub const Options = struct {
     read_buffer_size: usize = 16 * 1024,
     write_buffer_size: usize = 64 * 1024,
     max_body_bytes: usize = 4 * 1024 * 1024,
+    /// Buffer handed to streaming/SSE writers. Larger values reduce syscalls;
+    /// smaller values lower latency for chatty event streams.
+    stream_buffer_size: usize = 8 * 1024,
 };
 
 pub const Server = struct {
@@ -51,6 +54,8 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
     defer std.heap.smp_allocator.free(read_buffer);
     const write_buffer = std.heap.smp_allocator.alloc(u8, options.write_buffer_size) catch return;
     defer std.heap.smp_allocator.free(write_buffer);
+    const stream_buffer = std.heap.smp_allocator.alloc(u8, options.stream_buffer_size) catch return;
+    defer std.heap.smp_allocator.free(stream_buffer);
 
     var reader = Io.net.Stream.Reader.init(stream, io, read_buffer);
     var writer = Io.net.Stream.Writer.init(stream, io, write_buffer);
@@ -94,7 +99,7 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 
         var response = app.handle(req);
         defer response.deinit();
-        const outcome = sendResponse(&raw_req, &response) catch break;
+        const outcome = sendResponse(&raw_req, &response, stream_buffer) catch break;
         if (outcome == .upgraded) break;
     }
 }
@@ -104,7 +109,11 @@ const SendOutcome = enum {
     upgraded,
 };
 
-fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response) !SendOutcome {
+fn sendResponse(
+    raw_req: *std.http.Server.Request,
+    response: *const Response,
+    stream_buffer: []u8,
+) !SendOutcome {
     var extra_headers: [3]std.http.Header = undefined;
     var header_count: usize = 0;
 
@@ -135,11 +144,7 @@ fn sendResponse(raw_req: *std.http.Server.Request, response: *const Response) !S
 
     switch (response.runtime) {
         .none => {
-            try raw_req.respond(response.body, .{
-                .status = response.status,
-                .extra_headers = combined_headers,
-            });
-            return .keep_alive;
+            return sendBody(raw_req, response, combined_headers, stream_buffer);
         },
         .websocket => |runtime| {
             const requested = raw_req.upgradeRequested();
@@ -195,4 +200,68 @@ fn lookupHeader(ctx: *const anyopaque, name: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
     }
     return null;
+}
+
+/// Drives buffered, streaming, or SSE bodies. The streaming variants drive a
+/// `std.http.BodyWriter` (chunked or content-length) and surface the writer to
+/// user code through `response_mod.StreamWriter`/`SseWriter`.
+fn sendBody(
+    raw_req: *std.http.Server.Request,
+    response: *const Response,
+    combined_headers: []const std.http.Header,
+    stream_buffer: []u8,
+) !SendOutcome {
+    switch (response.body_kind) {
+        .buffered => |buffered| {
+            const payload = if (buffered.len > 0) buffered else response.body;
+            try raw_req.respond(payload, .{
+                .status = response.status,
+                .extra_headers = combined_headers,
+            });
+            return .keep_alive;
+        },
+        .stream => |runtime| {
+            var aborted: bool = false;
+            var body_writer = try raw_req.respondStreaming(stream_buffer, .{
+                .content_length = runtime.content_length,
+                .respond_options = .{
+                    .status = response.status,
+                    .extra_headers = combined_headers,
+                },
+            });
+            var stream_writer = response_mod.StreamWriter{
+                .inner = &body_writer.writer,
+                .aborted = &aborted,
+            };
+            runtime.run_fn(runtime.ctx, &stream_writer) catch {
+                aborted = true;
+            };
+            body_writer.end() catch {
+                aborted = true;
+            };
+            return if (aborted) .upgraded else .keep_alive;
+        },
+        .sse => |runtime| {
+            var aborted: bool = false;
+            var body_writer = try raw_req.respondStreaming(stream_buffer, .{
+                .content_length = null,
+                .respond_options = .{
+                    .status = response.status,
+                    .extra_headers = combined_headers,
+                },
+            });
+            var stream_writer = response_mod.StreamWriter{
+                .inner = &body_writer.writer,
+                .aborted = &aborted,
+            };
+            var sse_writer = response_mod.SseWriter{ .stream = &stream_writer };
+            runtime.run_fn(runtime.ctx, &sse_writer) catch {
+                aborted = true;
+            };
+            body_writer.end() catch {
+                aborted = true;
+            };
+            return if (aborted) .upgraded else .keep_alive;
+        },
+    }
 }

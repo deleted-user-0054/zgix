@@ -28,11 +28,6 @@ pub fn upgradeWebSocket(req: Request, comptime handler: anytype, websocket_optio
             protocol: ?[]const u8,
         };
 
-        fn deinit(allocator: std.mem.Allocator, ctx: *const anyopaque) void {
-            const data: *const Data = @ptrCast(@alignCast(ctx));
-            allocator.destroy(@constCast(data));
-        }
-
         fn run(ctx: *const anyopaque, socket: *response_mod.WebSocketConnection) anyerror!void {
             const data: *const Data = @ptrCast(@alignCast(ctx));
             const mode = comptime webSocketHandlerMode(@TypeOf(handler));
@@ -41,6 +36,15 @@ pub fn upgradeWebSocket(req: Request, comptime handler: anytype, websocket_optio
             } else {
                 try handler(socket);
             }
+        }
+
+        /// Type-erased deinit installed via `Response.attachScope`. Owns the
+        /// heap-allocated `Data` and frees it after the websocket lifecycle
+        /// completes.
+        fn scopeDeinit(scope_ptr: *anyopaque) void {
+            const data: *Data = @ptrCast(@alignCast(scope_ptr));
+            const allocator = data.req.allocator;
+            allocator.destroy(data);
         }
     };
 
@@ -54,9 +58,10 @@ pub fn upgradeWebSocket(req: Request, comptime handler: anytype, websocket_optio
         .ctx = data,
         .run_fn = Builder.run,
         .protocol = websocket_options.protocol,
-        .deinit_fn = Builder.deinit,
     });
-    response.runtime_allocator = req.allocator;
+    // Tie the heap `Data` lifetime to the response via the uniform scope
+    // mechanism; on attach failure we free the data and surface an error.
+    response.finalizeScope(req.allocator, @ptrCast(data), Builder.scopeDeinit);
     return response;
 }
 

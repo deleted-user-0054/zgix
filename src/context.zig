@@ -1,5 +1,7 @@
 const std = @import("std");
-const Request = @import("request.zig").Request;
+const request_mod = @import("request.zig");
+const Request = request_mod.Request;
+const ValidationTarget = request_mod.ValidationTarget;
 const Response = @import("response.zig").Response;
 const Handler = @import("router.zig").Handler;
 
@@ -9,6 +11,8 @@ const VariableEntry = struct {
     deinit_fn: *const fn (allocator: std.mem.Allocator, value: *anyopaque) void,
 };
 
+const RendererFn = *const fn (ctx: *anyopaque, content: []const u8) Response;
+
 pub const SharedState = struct {
     allocator: std.mem.Allocator,
     response: Response = .{
@@ -17,6 +21,8 @@ pub const SharedState = struct {
         .body = "",
     },
     variables: std.StringHashMapUnmanaged(VariableEntry) = .empty,
+    validated: std.StringHashMapUnmanaged(VariableEntry) = .empty,
+    renderer: ?RendererFn = null,
     not_found_handler: ?Handler = null,
     on_error_handler: ?*const fn (err: anyerror, req: Request) Response = null,
     last_error: ?anyerror = null,
@@ -29,53 +35,32 @@ pub const SharedState = struct {
 
     pub fn deinit(self: *SharedState) void {
         self.response.deinit();
-        var iterator = self.variables.iterator();
-        while (iterator.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit_fn(self.allocator, entry.value_ptr.value);
-        }
-        self.variables.deinit(self.allocator);
-        self.variables = .empty;
+        deinitVariableMap(self.allocator, &self.variables);
+        deinitVariableMap(self.allocator, &self.validated);
     }
 
     pub fn set(self: *SharedState, key: []const u8, value: anytype) std.mem.Allocator.Error!void {
-        const ValueType = @TypeOf(value);
-        const T = if (comptime isStringLike(ValueType)) []const u8 else ValueType;
-        const owned_key = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned_key);
-
-        const stored_value = try self.allocator.create(T);
-        errdefer self.allocator.destroy(stored_value);
-        stored_value.* = if (comptime isStringLike(ValueType)) value else value;
-
-        const entry: VariableEntry = .{
-            .value = @ptrCast(stored_value),
-            .type_name = @typeName(T),
-            .deinit_fn = deinitValueFn(T),
-        };
-
-        const result = try self.variables.getOrPut(self.allocator, key);
-        if (result.found_existing) {
-            self.allocator.free(owned_key);
-            result.value_ptr.deinit_fn(self.allocator, result.value_ptr.value);
-            result.value_ptr.* = entry;
-            return;
-        }
-
-        result.key_ptr.* = owned_key;
-        result.value_ptr.* = entry;
+        try putVariableValue(self.allocator, &self.variables, key, value);
     }
 
     pub fn get(self: *const SharedState, comptime T: type, key: []const u8) ?T {
-        const entry = self.variables.get(key) orelse return null;
-        if (!std.mem.eql(u8, entry.type_name, @typeName(T))) return null;
-
-        const typed_value: *const T = @ptrCast(@alignCast(entry.value));
-        return typed_value.*;
+        return getVariableValue(&self.variables, T, key);
     }
 
     pub fn contains(self: *const SharedState, key: []const u8) bool {
         return self.variables.contains(key);
+    }
+
+    pub fn setValid(self: *SharedState, comptime target: ValidationTarget, value: anytype) std.mem.Allocator.Error!void {
+        try putVariableValue(self.allocator, &self.validated, validationKey(target), value);
+    }
+
+    pub fn getValid(self: *const SharedState, comptime T: type, comptime target: ValidationTarget) ?T {
+        return getVariableValue(&self.validated, T, validationKey(target));
+    }
+
+    pub fn lookupValid(self: *const SharedState, target: ValidationTarget, type_name: []const u8) ?*const anyopaque {
+        return lookupVariableValue(&self.validated, validationKey(target), type_name);
     }
 };
 
@@ -96,6 +81,10 @@ pub const Context = struct {
     res: *Response,
     state: *SharedState,
     vars: Var,
+    raw: ?*const anyopaque = null,
+    env: ?*const anyopaque = null,
+    executionCtx: ?*const anyopaque = null,
+    event: ?*const anyopaque = null,
     err: ?anyerror = null,
 
     pub const Next = struct {
@@ -119,6 +108,10 @@ pub const Context = struct {
             .vars = .{
                 .state = state,
             },
+            .raw = req.raw,
+            .env = req.env,
+            .executionCtx = req.executionCtx,
+            .event = req.event,
             .err = state.last_error,
         };
     }
@@ -141,6 +134,34 @@ pub const Context = struct {
 
     pub fn get(self: *Context, comptime T: type, key: []const u8) ?T {
         return self.state.get(T, key);
+    }
+
+    pub fn setValid(self: *Context, comptime target: ValidationTarget, value: anytype) std.mem.Allocator.Error!void {
+        try self.state.setValid(target, value);
+    }
+
+    pub fn valid(self: *Context, comptime T: type, comptime target: ValidationTarget) ?T {
+        return self.req.valid(T, target);
+    }
+
+    pub fn rawAs(self: *Context, comptime T: type) ?*const T {
+        return self.req.rawAs(T);
+    }
+
+    pub fn envAs(self: *Context, comptime T: type) ?*const T {
+        return self.req.envAs(T);
+    }
+
+    pub fn executionCtxAs(self: *Context, comptime T: type) ?*const T {
+        return self.req.executionCtxAs(T);
+    }
+
+    pub fn eventAs(self: *Context, comptime T: type) ?*const T {
+        return self.req.eventAs(T);
+    }
+
+    pub fn setRenderer(self: *Context, comptime renderer: anytype) void {
+        self.state.renderer = resolveRenderer(renderer);
     }
 
     pub fn body(self: *Context, content: []const u8, content_type: []const u8) Response {
@@ -187,6 +208,22 @@ pub const Context = struct {
     pub fn jsonWithStatus(self: *Context, status_code: std.http.Status, value: anytype) Response {
         self.status(status_code);
         return self.json(value);
+    }
+
+    pub fn render(self: *Context, content: anytype) Response {
+        const ContentType = @TypeOf(content);
+        if (!comptime isStringLike(ContentType)) {
+            @compileError("Context.render accepts string-like content.");
+        }
+
+        const content_slice: []const u8 = content;
+        const response = if (self.state.renderer) |renderer|
+            renderer(@ptrCast(self), content_slice)
+        else
+            self.html(content_slice);
+
+        self.mergeResponse(response);
+        return self.takeResponse();
     }
 
     pub fn notFound(self: *Context) Response {
@@ -266,6 +303,139 @@ pub const Context = struct {
         self.res = &self.state.response;
     }
 };
+
+pub fn lookupValidatedValue(
+    ctx: *const anyopaque,
+    target: ValidationTarget,
+    type_name: []const u8,
+) ?*const anyopaque {
+    const state: *const SharedState = @ptrCast(@alignCast(ctx));
+    return state.lookupValid(target, type_name);
+}
+
+fn validationKey(target: ValidationTarget) []const u8 {
+    return switch (target) {
+        .form => "form",
+        .json => "json",
+        .query => "query",
+        .header => "header",
+        .cookie => "cookie",
+        .param => "param",
+    };
+}
+
+fn putVariableValue(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged(VariableEntry),
+    key: []const u8,
+    value: anytype,
+) std.mem.Allocator.Error!void {
+    const ValueType = @TypeOf(value);
+    const T = if (comptime isStringLike(ValueType)) []const u8 else ValueType;
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+
+    const stored_value = try allocator.create(T);
+    errdefer allocator.destroy(stored_value);
+    stored_value.* = if (comptime isStringLike(ValueType)) value else value;
+
+    const entry: VariableEntry = .{
+        .value = @ptrCast(stored_value),
+        .type_name = @typeName(T),
+        .deinit_fn = deinitValueFn(T),
+    };
+
+    const result = try map.getOrPut(allocator, key);
+    if (result.found_existing) {
+        allocator.free(owned_key);
+        result.value_ptr.deinit_fn(allocator, result.value_ptr.value);
+        result.value_ptr.* = entry;
+        return;
+    }
+
+    result.key_ptr.* = owned_key;
+    result.value_ptr.* = entry;
+}
+
+fn getVariableValue(
+    map: *const std.StringHashMapUnmanaged(VariableEntry),
+    comptime T: type,
+    key: []const u8,
+) ?T {
+    const entry = map.get(key) orelse return null;
+    if (!std.mem.eql(u8, entry.type_name, @typeName(T))) return null;
+
+    const typed_value: *const T = @ptrCast(@alignCast(entry.value));
+    return typed_value.*;
+}
+
+fn lookupVariableValue(
+    map: *const std.StringHashMapUnmanaged(VariableEntry),
+    key: []const u8,
+    type_name: []const u8,
+) ?*const anyopaque {
+    const entry = map.get(key) orelse return null;
+    if (!std.mem.eql(u8, entry.type_name, type_name)) return null;
+    return entry.value;
+}
+
+fn deinitVariableMap(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged(VariableEntry),
+) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit_fn(allocator, entry.value_ptr.value);
+    }
+    map.deinit(allocator);
+    map.* = .empty;
+}
+
+fn resolveRenderer(comptime target: anytype) RendererFn {
+    const TargetType = @TypeOf(target);
+    return switch (comptime @typeInfo(TargetType)) {
+        .@"fn" => resolveRendererFn(target, TargetType),
+        .pointer => |pointer| switch (@typeInfo(pointer.child)) {
+            .@"fn" => resolveRendererFn(target, pointer.child),
+            else => @compileError("Context.setRenderer requires fn(content: []const u8) zono.Response or fn(c: *zono.Context, content: []const u8) zono.Response."),
+        },
+        else => @compileError("Context.setRenderer requires fn(content: []const u8) zono.Response or fn(c: *zono.Context, content: []const u8) zono.Response."),
+    };
+}
+
+fn resolveRendererFn(comptime target: anytype, comptime FnType: type) RendererFn {
+    const info = @typeInfo(FnType).@"fn";
+    if (info.return_type == null or info.return_type.? != Response) {
+        @compileError("Context renderer functions must return zono.Response.");
+    }
+    if (info.params.len == 1 and info.params[0].type != null and info.params[0].type.? == []const u8) {
+        return wrapPlainRenderer(target);
+    }
+    if (info.params.len == 2 and info.params[0].type != null and info.params[0].type.? == *Context and info.params[1].type != null and info.params[1].type.? == []const u8) {
+        return wrapContextRenderer(target);
+    }
+
+    @compileError("Context.setRenderer requires fn(content: []const u8) zono.Response or fn(c: *zono.Context, content: []const u8) zono.Response.");
+}
+
+fn wrapPlainRenderer(comptime target: anytype) RendererFn {
+    return struct {
+        fn run(ctx: *anyopaque, content: []const u8) Response {
+            _ = ctx;
+            return target(content);
+        }
+    }.run;
+}
+
+fn wrapContextRenderer(comptime target: anytype) RendererFn {
+    return struct {
+        fn run(ctx: *anyopaque, content: []const u8) Response {
+            const context: *Context = @ptrCast(@alignCast(ctx));
+            return target(context, content);
+        }
+    }.run;
+}
 
 fn deinitValueFn(comptime T: type) *const fn (allocator: std.mem.Allocator, value: *anyopaque) void {
     return struct {

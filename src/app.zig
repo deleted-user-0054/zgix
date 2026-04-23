@@ -55,6 +55,10 @@ pub const App = struct {
         headers: []const std.http.Header = &.{},
         body: []const u8 = "",
         cookies_raw: ?[]const u8 = null,
+        raw: ?*const anyopaque = null,
+        env: ?*const anyopaque = null,
+        executionCtx: ?*const anyopaque = null,
+        event: ?*const anyopaque = null,
     };
 
     pub const Options = struct {
@@ -331,6 +335,8 @@ pub const App = struct {
         defer state.not_found_handler = previous_not_found_handler;
         defer state.on_error_handler = previous_on_error_handler;
         defer if (owns_context_state) shared_state.deinit();
+        handled_req.validation_lookup_ctx = @ptrCast(state);
+        handled_req.validation_lookup_fn = context_mod.lookupValidatedValue;
 
         if (self.middlewares.items.len == 0) return self.handleEndpoint(handled_req);
         return self.runMiddlewares(handled_req, 0);
@@ -439,6 +445,10 @@ pub const App = struct {
         req.header_list = req_options.headers;
         req.body = req_options.body;
         req.cookies_raw = req_options.cookies_raw orelse "";
+        req.raw = req_options.raw;
+        req.env = req_options.env;
+        req.executionCtx = req_options.executionCtx;
+        req.event = req_options.event;
 
         var response = self.handle(req);
         defer response.deinit();
@@ -1931,6 +1941,172 @@ test "app context sugar can set status inline" {
     const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-sugar"));
     try std.testing.expectEqual(std.http.Status.created, res.status);
     try std.testing.expectEqualStrings("created", res.body);
+}
+
+test "app request options expose env executionCtx event and raw through context" {
+    const RawValue = struct { code: u32 };
+    const EnvValue = struct { name: []const u8 };
+    const EventValue = struct { id: u32 };
+    const ExecValue = struct { ready: bool };
+
+    const raw_value = RawValue{ .code = 7 };
+    const env_value = EnvValue{ .name = "prod" };
+    const event_value = EventValue{ .id = 42 };
+    const exec_value = ExecValue{ .ready = true };
+
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/platform", struct {
+        fn run(c: *Context) Response {
+            const payload = struct {
+                env: []const u8,
+                event: u32,
+                raw: u32,
+                ready: bool,
+            }{
+                .env = c.envAs(EnvValue).?.name,
+                .event = c.eventAs(EventValue).?.id,
+                .raw = c.rawAs(RawValue).?.code,
+                .ready = c.executionCtxAs(ExecValue).?.ready,
+            };
+            return c.json(payload);
+        }
+    }.run);
+
+    var res = try app.request(std.testing.allocator, "/platform", .{
+        .raw = @ptrCast(&raw_value),
+        .env = @ptrCast(&env_value),
+        .event = @ptrCast(&event_value),
+        .executionCtx = @ptrCast(&exec_value),
+    });
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("{\"env\":\"prod\",\"event\":42,\"raw\":7,\"ready\":true}", res.body);
+}
+
+test "app context renderer wraps downstream content" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.setRenderer(struct {
+                fn render(ctx: *Context, content: []const u8) Response {
+                    const wrapped = std.fmt.allocPrint(ctx.req.allocator, "<main>{s}</main>", .{content}) catch {
+                        return response_mod.internalError("alloc failed");
+                    };
+                    _ = ctx.header("x-renderer", "context");
+                    return ctx.html(wrapped);
+                }
+            }.render);
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/render", struct {
+        fn run(c: *Context) Response {
+            return c.render("hello");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/render"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("<main>hello</main>", res.body);
+    try std.testing.expectEqualStrings("context", responseHeaderValue(res, "x-renderer").?);
+}
+
+test "app plain renderer functions are supported" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.setRenderer(struct {
+                fn render(content: []const u8) Response {
+                    return response_mod.html(content);
+                }
+            }.render);
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/render-plain", struct {
+        fn run(c: *Context) Response {
+            return c.render("<strong>ok</strong>");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/render-plain"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("<strong>ok</strong>", res.body);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", res.content_type);
+}
+
+test "app validated values flow from context middleware into request handlers" {
+    const Claims = struct {
+        user_id: u32,
+    };
+
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.setValid(.json, Claims{
+                .user_id = 42,
+            }) catch return response_mod.internalError("valid failed");
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/valid-request", struct {
+        fn run(req: Request) Response {
+            const claims = req.valid(Claims, .json) orelse return response_mod.internalError("missing claims");
+            return response_mod.text(.ok, if (claims.user_id == 42) "ok" else "bad");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/valid-request"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("ok", res.body);
+}
+
+test "app validated values flow into context handlers" {
+    const QueryValue = struct {
+        page: u32,
+    };
+
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.use(struct {
+        fn run(c: *Context, next: Context.Next) Response {
+            c.setValid(.query, QueryValue{
+                .page = 3,
+            }) catch return response_mod.internalError("valid failed");
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+    try app.get("/valid-context", struct {
+        fn run(c: *Context) Response {
+            const query = c.valid(QueryValue, .query) orelse return response_mod.internalError("missing query");
+            return c.textWithStatus(.ok, if (query.page == 3) "page-3" else "bad");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/valid-context"));
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("page-3", res.body);
 }
 
 test "app mount delegates prefixed requests to mounted apps" {

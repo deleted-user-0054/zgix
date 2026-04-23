@@ -8,6 +8,7 @@ pub const Param = struct {
 pub const Header = std.http.Header;
 const HeaderLookupFn = *const fn (ctx: *const anyopaque, name: []const u8) ?[]const u8;
 const HeadersCollectFn = *const fn (ctx: *const anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const Header;
+const ValidationLookupFn = *const fn (ctx: *const anyopaque, target: ValidationTarget, type_name: []const u8) ?*const anyopaque;
 pub const FormError = std.mem.Allocator.Error || error{
     InvalidPercentEncoding,
 };
@@ -16,6 +17,20 @@ pub const ParseBodyError = FormError || error{
     MissingMultipartBoundary,
     InvalidMultipartBody,
     UnsupportedMultipartFile,
+};
+
+pub const ValidationTarget = enum {
+    form,
+    json,
+    query,
+    header,
+    cookie,
+    param,
+};
+
+pub const RequestBlob = struct {
+    bytes: []const u8,
+    content_type: ?[]const u8 = null,
 };
 
 pub const ParseBodyOptions = struct {
@@ -298,11 +313,17 @@ pub const Request = struct {
     path: []const u8,
     query_string: []const u8 = "",
     body: []const u8 = "",
+    raw: ?*const anyopaque = null,
+    env: ?*const anyopaque = null,
+    executionCtx: ?*const anyopaque = null,
+    event: ?*const anyopaque = null,
     cookies_raw: []const u8 = "",
     header_list: []const Header = &.{},
     header_lookup_ctx: ?*const anyopaque = null,
     header_lookup_fn: ?HeaderLookupFn = null,
     headers_collect_fn: ?HeadersCollectFn = null,
+    validation_lookup_ctx: ?*const anyopaque = null,
+    validation_lookup_fn: ?ValidationLookupFn = null,
     params: []const Param = &.{},
     context_state: ?*anyopaque = null,
 
@@ -316,6 +337,30 @@ pub const Request = struct {
 
     pub fn contextState(self: Request) ?*anyopaque {
         return self.context_state;
+    }
+
+    pub fn rawAs(self: Request, comptime T: type) ?*const T {
+        return castOpaquePtr(T, self.raw);
+    }
+
+    pub fn envAs(self: Request, comptime T: type) ?*const T {
+        return castOpaquePtr(T, self.env);
+    }
+
+    pub fn executionCtxAs(self: Request, comptime T: type) ?*const T {
+        return castOpaquePtr(T, self.executionCtx);
+    }
+
+    pub fn eventAs(self: Request, comptime T: type) ?*const T {
+        return castOpaquePtr(T, self.event);
+    }
+
+    pub fn valid(self: Request, comptime T: type, comptime target: ValidationTarget) ?T {
+        const lookup = self.validation_lookup_fn orelse return null;
+        const ctx = self.validation_lookup_ctx orelse return null;
+        const value_ptr = lookup(ctx, target, @typeName(T)) orelse return null;
+        const typed_value: *const T = @ptrCast(@alignCast(value_ptr));
+        return typed_value.*;
     }
 
     pub fn param(self: Request, name_or_mode: anytype) ParamResultType(@TypeOf(name_or_mode)) {
@@ -583,10 +628,27 @@ pub const Request = struct {
         return self.body;
     }
 
+    pub fn arrayBuffer(self: Request) []const u8 {
+        return self.body;
+    }
+
+    pub fn blob(self: Request) RequestBlob {
+        return .{
+            .bytes = self.body,
+            .content_type = self.contentType(),
+        };
+    }
+
     pub fn json(self: Request, comptime T: type) !?std.json.Parsed(T) {
         if (self.body.len == 0) return null;
         return try std.json.parseFromSlice(T, self.allocator, self.body, .{
             .ignore_unknown_fields = true,
+        });
+    }
+
+    pub fn formData(self: Request) ParseBodyError!ParsedFormData {
+        return try self.parseBody(.{
+            .all = true,
         });
     }
 
@@ -719,6 +781,11 @@ fn CookieResultType(comptime NameType: type) type {
     if (comptime isStringLike(NameType)) return ?[]const u8;
     if (NameType == @TypeOf(.enum_literal)) return std.mem.Allocator.Error!ParsedBody;
     @compileError("Request.cookie accepts a cookie name string or .all.");
+}
+
+fn castOpaquePtr(comptime T: type, value: ?*const anyopaque) ?*const T {
+    const raw = value orelse return null;
+    return @ptrCast(@alignCast(raw));
 }
 
 fn isStringLike(comptime T: type) bool {
@@ -1481,6 +1548,42 @@ test "request json parses typed payloads" {
     try std.testing.expectEqualStrings("hello", parsed.value.title);
 }
 
+test "request raw accessors expose platform pointers" {
+    const RawValue = struct { code: u32 };
+    const EnvValue = struct { name: []const u8 };
+    const EventValue = struct { id: u32 };
+    const ExecValue = struct { ready: bool };
+
+    const raw_value = RawValue{ .code = 7 };
+    const env_value = EnvValue{ .name = "prod" };
+    const event_value = EventValue{ .id = 42 };
+    const exec_value = ExecValue{ .ready = true };
+
+    var req = Request.init(std.testing.allocator, .POST, "/");
+    req.raw = @ptrCast(&raw_value);
+    req.env = @ptrCast(&env_value);
+    req.event = @ptrCast(&event_value);
+    req.executionCtx = @ptrCast(&exec_value);
+
+    try std.testing.expectEqual(@as(u32, 7), req.rawAs(RawValue).?.code);
+    try std.testing.expectEqualStrings("prod", req.envAs(EnvValue).?.name);
+    try std.testing.expectEqual(@as(u32, 42), req.eventAs(EventValue).?.id);
+    try std.testing.expect(req.executionCtxAs(ExecValue).?.ready);
+}
+
+test "request arrayBuffer and blob expose raw body bytes" {
+    var req = Request.init(std.testing.allocator, .POST, "/submit");
+    req.header_list = &.{
+        .{ .name = "content-type", .value = "application/octet-stream" },
+    };
+    req.body = "hello";
+
+    try std.testing.expectEqualStrings("hello", req.arrayBuffer());
+    const blob = req.blob();
+    try std.testing.expectEqualStrings("hello", blob.bytes);
+    try std.testing.expectEqualStrings("application/octet-stream", blob.content_type.?);
+}
+
 test "request contentType ignores parameters" {
     var req = Request.init(std.testing.allocator, .POST, "/submit");
     req.header_list = &.{
@@ -1706,6 +1809,23 @@ test "request parseBody multipart returns files directly" {
     try std.testing.expectEqualStrings("a.txt", avatar.filename);
     try std.testing.expectEqualStrings("text/plain", avatar.content_type.?);
     try std.testing.expectEqualStrings("hello", avatar.content);
+}
+
+test "request formData preserves repeated values" {
+    var req = Request.init(std.testing.allocator, .POST, "/submit");
+    req.header_list = &.{
+        .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
+    };
+    req.body = "tag=zig&tag=router&title=zono";
+
+    var form = try req.formData();
+    defer form.deinit();
+
+    const tags = form.values("tag").?;
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqualStrings("zig", tags[0]);
+    try std.testing.expectEqualStrings("router", tags[1]);
+    try std.testing.expectEqualStrings("zono", form.value("title").?);
 }
 
 test "request param .all returns an aggregated params view" {

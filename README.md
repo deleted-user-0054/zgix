@@ -14,6 +14,9 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Minimal server runtime under `zono.Server`
 - Request helpers for params, parsed params/query/cookie/header views, `.all` aggregate access, cookies, and typed JSON parsing
 - `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing, and dotted-key grouping through `Request.parseBody()`, `Response.cookie()`, and a low-level `zono.body()` response helper
+- Thin platform context hooks through `req.raw`, `c.env`, `c.executionCtx`, and `c.event`
+- Web-style request body helpers through `req.arrayBuffer()`, `req.blob()`, and `req.formData()`
+- Context rendering and validated-data hooks through `c.setRenderer()`, `c.render()`, `c.setValid()`, and `req.valid()`
 - `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start
@@ -232,6 +235,39 @@ pub fn main() !void {
 }
 ```
 
+### Rendering
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.use(struct {
+        fn run(c: *zono.Context, next: zono.Context.Next) zono.Response {
+            c.setRenderer(struct {
+                fn render(ctx: *zono.Context, content: []const u8) zono.Response {
+                    const page = std.fmt.allocPrint(ctx.req.allocator, "<main>{s}</main>", .{content}) catch {
+                        return zono.internalError("alloc failed");
+                    };
+                    return ctx.html(page);
+                }
+            }.render);
+            next.run();
+            return c.takeResponse();
+        }
+    }.run);
+
+    try app.get("/render", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.render("hello");
+        }
+    }.run);
+}
+```
+
 ### Request Testing
 
 ```zig
@@ -252,6 +288,37 @@ test "search route" {
     defer res.deinit();
 
     try std.testing.expectEqualStrings("zig", res.body);
+}
+```
+
+### Platform Context
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+const Env = struct {
+    mode: []const u8,
+};
+
+fn showPlatform(c: *zono.Context) zono.Response {
+    const env = c.envAs(Env) orelse return zono.text(.internal_server_error, "missing env");
+    return c.text(env.mode);
+}
+
+test "platform values" {
+    var app = zono.App.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.get("/platform", showPlatform);
+
+    const env = Env{ .mode = "test" };
+    var res = try app.request(std.testing.allocator, "/platform", .{
+        .env = @ptrCast(&env),
+    });
+    defer res.deinit();
+
+    try std.testing.expectEqualStrings("test", res.body);
 }
 ```
 
@@ -317,6 +384,24 @@ fn upload(req: zono.Request) zono.Response {
     _ = avatar;
 
     return zono.text(.ok, body.value("display_name") orelse "ok");
+}
+```
+
+### Web-Style Body Helpers
+
+```zig
+const zono = @import("zono");
+
+fn upload(req: zono.Request) zono.Response {
+    const bytes = req.arrayBuffer();
+    const blob = req.blob();
+    _ = bytes;
+    _ = blob;
+
+    var form = req.formData() catch return zono.text(.bad_request, "invalid form data");
+    defer form.deinit();
+
+    return zono.text(.ok, form.value("title") orelse "ok");
 }
 ```
 
@@ -388,5 +473,26 @@ fn submit(req: zono.Request) zono.Response {
     _ = avatar;
 
     return zono.text(.ok, user.value("name") orelse "missing");
+}
+```
+
+### Validated Data
+
+```zig
+const zono = @import("zono");
+
+const Query = struct {
+    page: u32,
+};
+
+fn validator(c: *zono.Context, next: zono.Context.Next) zono.Response {
+    c.setValid(.query, Query{ .page = 3 }) catch return zono.internalError("valid failed");
+    next.run();
+    return c.takeResponse();
+}
+
+fn list(req: zono.Request) zono.Response {
+    const query = req.valid(Query, .query) orelse return zono.text(.bad_request, "missing query");
+    return zono.text(.ok, if (query.page == 3) "page-3" else "bad");
 }
 ```

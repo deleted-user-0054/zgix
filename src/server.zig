@@ -86,6 +86,7 @@ fn handleConn(io: Io, stream: Io.net.Stream, app: *App, options: Options) Io.Can
 
         var req = Request.init(alloc, raw_req.head.method, path);
         req.query_string = query_string;
+        req.raw = @ptrCast(&raw_req);
         req.header_lookup_ctx = @ptrCast(&raw_req);
         req.header_lookup_fn = lookupHeader;
         req.headers_collect_fn = collectHeaders;
@@ -145,7 +146,7 @@ fn collectHeaders(
     ctx: *const anyopaque,
     allocator: std.mem.Allocator,
 ) ![]const std.http.Header {
-    const raw_req: *std.http.Server.Request = @constCast(@ptrCast(@alignCast(ctx)));
+    const raw_req: *std.http.Server.Request = @ptrCast(@alignCast(@constCast(ctx)));
     var headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     errdefer headers.deinit(allocator);
 
@@ -159,7 +160,7 @@ fn collectHeaders(
 }
 
 fn lookupHeader(ctx: *const anyopaque, name: []const u8) ?[]const u8 {
-    const raw_req: *std.http.Server.Request = @constCast(@ptrCast(@alignCast(ctx)));
+    const raw_req: *std.http.Server.Request = @ptrCast(@alignCast(@constCast(ctx)));
     var iter = raw_req.iterateHeaders();
     while (iter.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;

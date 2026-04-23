@@ -18,6 +18,30 @@ pub fn validator(comptime target: ValidationTarget, comptime parser: anytype) Va
     return .{};
 }
 
+pub fn form(comptime parser: anytype) ValidatorMarker(.form, parser) {
+    return validator(.form, parser);
+}
+
+pub fn json(comptime parser: anytype) ValidatorMarker(.json, parser) {
+    return validator(.json, parser);
+}
+
+pub fn query(comptime parser: anytype) ValidatorMarker(.query, parser) {
+    return validator(.query, parser);
+}
+
+pub fn header(comptime parser: anytype) ValidatorMarker(.header, parser) {
+    return validator(.header, parser);
+}
+
+pub fn cookie(comptime parser: anytype) ValidatorMarker(.cookie, parser) {
+    return validator(.cookie, parser);
+}
+
+pub fn param(comptime parser: anytype) ValidatorMarker(.param, parser) {
+    return validator(.param, parser);
+}
+
 pub fn wrapValidator(comptime target: ValidationTarget, comptime parser: anytype) *const fn (*Context, Context.Next) anyerror!Response {
     const ParserResult = parserResultType(parser);
 
@@ -74,4 +98,20 @@ fn parserInfo(comptime parser: anytype) std.builtin.Type.Fn {
         },
         else => @compileError("zono.validator requires a function or function pointer parser."),
     };
+}
+
+test "validator target sugar helpers preserve the correct target" {
+    const QueryValidator = @TypeOf(query(struct {
+        fn run(_: Request) struct { page: u32 } {
+            return .{ .page = 1 };
+        }
+    }.run));
+    const JsonValidator = @TypeOf(json(struct {
+        fn run(_: Request) struct { ok: bool } {
+            return .{ .ok = true };
+        }
+    }.run));
+
+    try std.testing.expectEqual(ValidationTarget.query, QueryValidator.validator_target);
+    try std.testing.expectEqual(ValidationTarget.json, JsonValidator.validator_target);
 }

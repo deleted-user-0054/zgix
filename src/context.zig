@@ -7,6 +7,7 @@ const Response = @import("response.zig").Response;
 const http_exception_mod = @import("http_exception.zig");
 const HTTPException = http_exception_mod.HTTPException;
 const StoredHTTPException = http_exception_mod.StoredHTTPException;
+const realtime_mod = @import("realtime.zig");
 const Handler = @import("router.zig").Handler;
 
 const VariableEntry = struct {
@@ -276,6 +277,21 @@ pub const Context = struct {
         else
             self.html(content_slice);
 
+        self.mergeResponse(response);
+        return self.takeResponse();
+    }
+
+    pub fn sse(self: *Context, events: anytype) Response {
+        const response = realtime_mod.sse(self.req.allocator, events) catch return @import("response.zig").internalError("sse write failed");
+        self.mergeResponse(response);
+        return self.takeResponse();
+    }
+
+    pub fn acceptWebSocket(
+        self: *Context,
+        websocket_options: realtime_mod.WebSocketAcceptOptions,
+    ) realtime_mod.WebSocketUpgradeError!Response {
+        const response = try realtime_mod.acceptWebSocket(self.req, websocket_options);
         self.mergeResponse(response);
         return self.takeResponse();
     }

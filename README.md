@@ -18,6 +18,7 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 - Thin platform context hooks through `req.raw`, `c.env`, `c.executionCtx`, and `c.event`
 - Web-style request body helpers through `req.arrayBuffer()`, `req.blob()`, and `req.formData()`
 - Context rendering and validated-data hooks through `c.setRenderer()`, `c.render()`, `c.setValid()`, `req.valid()`, and `zono.validator(...)`
+- Built-in helpers for `zono.serveStatic()`, `zono.cors()`, `zono.logger()`, `c.sse()`, `c.acceptWebSocket()`, and target-specific validator sugar such as `zono.validatorQuery(...)`
 - Lightweight `HTTPException` handling through `c.throw()` / `req.throw()`
 - `app.request()` and `app.fetchRaw()` for lightweight route testing and raw adapter entry points without the server runtime
 
@@ -148,6 +149,24 @@ pub fn main() !void {
 }
 ```
 
+### Built-In Middleware
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.use(zono.cors(.{
+        .allow_origin = .mirror,
+        .allow_credentials = true,
+    }));
+    try app.use(zono.logger(.{}));
+}
+```
+
 ### Route-Level Middleware
 
 ```zig
@@ -245,7 +264,7 @@ pub fn main() !void {
     var app = zono.App.init(std.heap.page_allocator);
     defer app.deinit();
 
-    try app.use(zono.validator(.query, struct {
+    try app.use(zono.validatorQuery(struct {
         fn run(req: zono.Request) !Query {
             var query = try req.parseQuery(.{});
             defer query.deinit();
@@ -262,6 +281,23 @@ pub fn main() !void {
             return zono.text(.ok, if (query.page == 1) "page-1" else "other");
         }
     }.run);
+}
+```
+
+### Static Files
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/assets/*path", zono.serveStatic(.{
+        .root = "public",
+        .cache_control = "public, max-age=3600",
+    }));
 }
 ```
 
@@ -356,6 +392,34 @@ pub fn main() !void {
     try app.get("/render", struct {
         fn run(c: *zono.Context) zono.Response {
             return c.render("hello");
+        }
+    }.run);
+}
+```
+
+### SSE And WebSocket Handshakes
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/events", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.sse(&[_]zono.SSEEvent{
+                .{ .event = "ready", .data = "hello" },
+            });
+        }
+    }.run);
+
+    try app.get("/ws", struct {
+        fn run(c: *zono.Context) zono.Response {
+            return c.acceptWebSocket(.{
+                .protocol = "chat",
+            }) catch zono.text(.bad_request, "upgrade required");
         }
     }.run);
 }

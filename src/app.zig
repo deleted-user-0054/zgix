@@ -513,7 +513,7 @@ pub const App = struct {
     fn materializeResponse(allocator: std.mem.Allocator, response: *response_mod.Response) !Response {
         return switch (response.body_kind) {
             .buffered => try response.clone(allocator),
-            .stream, .sse => try response.renderStreamingToBuffered(allocator),
+            .stream, .sse, .file => try response.renderStreamingToBuffered(allocator),
         };
     }
 

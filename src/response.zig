@@ -214,13 +214,36 @@ pub const SseRuntime = struct {
     run_fn: SseRunFn,
 };
 
+/// Runtime description for a streaming file response. The server opens
+/// `path` (relative to `std.Io.Dir.cwd()`), stats it to populate the
+/// `Content-Length` header, and pumps file bytes into the response body
+/// writer without materializing the whole file in memory.
+///
+/// `head_only` lets handlers (e.g. `serveStatic` for `HEAD`) emit the same
+/// headers without a body. `max_bytes` caps the response when stat reports
+/// a larger file (server returns 500 in that case to avoid truncation).
+/// `Content-Type` lives on the enclosing `Response` struct and is not
+/// duplicated here.
+pub const FileRuntime = struct {
+    path: []const u8,
+    max_bytes: u64 = std.math.maxInt(u64),
+    head_only: bool = false,
+    /// When set, `Response.deinit` frees `path` via this allocator. Handlers
+    /// that dupe the path into the request allocator (e.g. `serveStatic`)
+    /// should set this so the response owns the string. Constructors that
+    /// borrow a caller-owned path should leave it `null`.
+    path_owner: ?std.mem.Allocator = null,
+};
+
 /// Discriminates how the response body is delivered. Most code paths produce
 /// `.buffered`, but `.stream`/`.sse` allow chunked/streaming output and
-/// `.sendfile` will (PR4) hand off to zero-copy file delivery.
+/// `.file` hands off to the server for zero-copy file delivery (PR4a: open +
+/// stat + `streamRemaining` into the `BodyWriter`).
 pub const Body = union(enum) {
     buffered: []const u8,
     stream: StreamRuntime,
     sse: SseRuntime,
+    file: FileRuntime,
 };
 
 /// Linked list node describing a heap-allocated "scope" whose lifetime is
@@ -437,7 +460,7 @@ pub const Response = struct {
         if (self.runtime != .none) return error.UnsupportedRuntimeClone;
         switch (self.body_kind) {
             .buffered => {},
-            .stream, .sse => return error.UnsupportedRuntimeClone,
+            .stream, .sse, .file => return error.UnsupportedRuntimeClone,
         }
 
         var cloned: Response = .{
@@ -502,7 +525,7 @@ pub const Response = struct {
         scope_deinit: *const fn (scope: *anyopaque) void,
     ) void {
         const needs_extension = switch (self.body_kind) {
-            .stream, .sse => true,
+            .stream, .sse, .file => true,
             .buffered => self.runtime != .none, // websocket etc. also need extension
         };
 
@@ -526,6 +549,16 @@ pub const Response = struct {
             node.deinit_fn(node.ptr);
             node.allocator.destroy(node);
             scope_iter = next;
+        }
+
+        // Free response-owned runtime state BEFORE clearing body_kind below.
+        // Currently only `.file` may carry an owned path; other runtimes have
+        // their state freed via the scope chain above.
+        switch (self.body_kind) {
+            .file => |runtime| {
+                if (runtime.path_owner) |allocator| allocator.free(runtime.path);
+            },
+            else => {},
         }
 
         if (self.owned_allocator) |allocator| {
@@ -586,6 +619,27 @@ pub const Response = struct {
                 try aw.writer.flush();
                 const bytes = try aw.toOwnedSlice();
                 return try buildBufferedClone(self, allocator, bytes);
+            },
+            .file => |runtime| {
+                // `App.handle`/`App.request` tests route through here: no live
+                // server io exists, so we spin up a local `Io.Threaded` just
+                // long enough to read the file. Production delivery never hits
+                // this branch because the server has its own `.file` path in
+                // `sendBody`.
+                var io_impl = std.Io.Threaded.init_single_threaded;
+                const io = io_impl.io();
+
+                const bytes = std.Io.Dir.cwd().readFileAlloc(io, runtime.path, allocator, .limited(runtime.max_bytes)) catch {
+                    const empty = try allocator.dupe(u8, "");
+                    return try buildBufferedClone(self, allocator, empty);
+                };
+
+                const payload = if (runtime.head_only) blk: {
+                    allocator.free(bytes);
+                    break :blk try allocator.dupe(u8, "");
+                } else bytes;
+
+                return try buildBufferedClone(self, allocator, payload);
             },
         }
     }
@@ -886,6 +940,34 @@ pub fn sse(runtime: SseRuntime) Response {
         .body_kind = .{ .sse = runtime },
     };
 }
+
+/// Build a streaming file response. The server opens `path` (relative to
+/// `std.Io.Dir.cwd()`), stats it for `Content-Length`, and pumps bytes from
+/// the file into the body writer — no full read into memory. `content_type`
+/// sets the response's `Content-Type`; pass `"application/octet-stream"` as a
+/// safe default when you don't know.
+///
+/// `max_bytes` caps the response when the file is larger than expected (the
+/// server returns 500 in that case). Set `head_only = true` to emit the same
+/// headers for `HEAD` with no body.
+pub fn file(path: []const u8, content_type: []const u8, file_options: FileOptions) Response {
+    return .{
+        .status = file_options.status,
+        .content_type = content_type,
+        .body = "",
+        .body_kind = .{ .file = .{
+            .path = path,
+            .max_bytes = file_options.max_bytes,
+            .head_only = file_options.head_only,
+        } },
+    };
+}
+
+pub const FileOptions = struct {
+    status: std.http.Status = .ok,
+    max_bytes: u64 = std.math.maxInt(u64),
+    head_only: bool = false,
+};
 
 pub fn typedJson(allocator: std.mem.Allocator, value: anytype) Response {
     var out: std.Io.Writer.Allocating = .init(allocator);

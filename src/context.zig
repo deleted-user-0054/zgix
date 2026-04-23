@@ -92,6 +92,16 @@ pub const Context = struct {
         self.res.setStatus(value);
     }
 
+    /// Returns the live `std.Io` handle bound to the server that is servicing
+    /// this request. `null` in unit-test paths that go through `App.handle`
+    /// directly without booting a `Server`. Handlers that need to do real
+    /// I/O (open files, outbound client calls, sleep, etc.) should use this
+    /// instead of spinning up their own `Io.Threaded`, which would escape
+    /// the server's scheduling and cancellation.
+    pub fn io(self: *Context) ?std.Io {
+        return self.req.server_io;
+    }
+
     pub fn header(self: *Context, name: []const u8, value: []const u8) bool {
         return self.res.header(name, value);
     }

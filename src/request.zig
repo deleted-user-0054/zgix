@@ -304,6 +304,11 @@ pub const Request = struct {
     headers_collect_fn: ?HeadersCollectFn = null,
     params: []const Param = &.{},
     context_state: ?*anyopaque = null,
+    /// Live `std.Io` handle for the server that received this request.
+    /// Populated in production by `server.zig`; `null` in test paths that
+    /// call `App.handle` directly without a server. Handlers can reach it
+    /// via `Context.io()` to do real file I/O, outbound client calls, etc.
+    server_io: ?std.Io = null,
 
     pub fn init(allocator: std.mem.Allocator, method: std.http.Method, path: []const u8) Request {
         return .{

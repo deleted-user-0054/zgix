@@ -108,7 +108,7 @@ pub const StreamWriter = struct {
     /// content-length framing is handled by the writer's vtable). In tests
     /// `App.request` substitutes an in-memory `std.Io.Writer.Allocating`.
     inner: *std.Io.Writer,
-    aborted: *const bool,
+    aborted: *const std.atomic.Value(bool),
 
     pub const Error = std.Io.Writer.Error;
 
@@ -136,7 +136,7 @@ pub const StreamWriter = struct {
     /// True once the connection is no longer usable (peer closed, server
     /// shutdown, etc). Stream handlers should poll this between chunks.
     pub fn isAborted(self: *const StreamWriter) bool {
-        return self.aborted.*;
+        return self.aborted.load(.acquire);
     }
 };
 
@@ -563,7 +563,7 @@ pub const Response = struct {
             .stream => |runtime| {
                 var aw: std.Io.Writer.Allocating = .init(allocator);
                 errdefer aw.deinit();
-                var aborted: bool = false;
+                var aborted: std.atomic.Value(bool) = .init(false);
                 var sw = StreamWriter{
                     .inner = &aw.writer,
                     .aborted = &aborted,
@@ -576,7 +576,7 @@ pub const Response = struct {
             .sse => |runtime| {
                 var aw: std.Io.Writer.Allocating = .init(allocator);
                 errdefer aw.deinit();
-                var aborted: bool = false;
+                var aborted: std.atomic.Value(bool) = .init(false);
                 var sw = StreamWriter{
                     .inner = &aw.writer,
                     .aborted = &aborted,

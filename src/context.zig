@@ -151,12 +151,25 @@ pub const Context = struct {
         return self.takeResponse();
     }
 
+    pub fn bodyWithStatus(self: *Context, status_code: std.http.Status, content: []const u8, content_type: []const u8) Response {
+        self.status(status_code);
+        return self.body(content, content_type);
+    }
+
     pub fn text(self: *Context, content: []const u8) Response {
         return self.body(content, "text/plain; charset=utf-8");
     }
 
+    pub fn textWithStatus(self: *Context, status_code: std.http.Status, content: []const u8) Response {
+        return self.bodyWithStatus(status_code, content, "text/plain; charset=utf-8");
+    }
+
     pub fn html(self: *Context, content: []const u8) Response {
         return self.body(content, "text/html; charset=utf-8");
+    }
+
+    pub fn htmlWithStatus(self: *Context, status_code: std.http.Status, content: []const u8) Response {
+        return self.bodyWithStatus(status_code, content, "text/html; charset=utf-8");
     }
 
     pub fn json(self: *Context, value: anytype) Response {
@@ -169,6 +182,11 @@ pub const Context = struct {
         var stringify: std.json.Stringify = .{ .writer = &out.writer };
         stringify.write(value) catch return @import("response.zig").internalError("json write failed");
         return self.body(out.written(), "application/json; charset=utf-8");
+    }
+
+    pub fn jsonWithStatus(self: *Context, status_code: std.http.Status, value: anytype) Response {
+        self.status(status_code);
+        return self.json(value);
     }
 
     pub fn notFound(self: *Context) Response {

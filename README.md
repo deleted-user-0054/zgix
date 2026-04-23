@@ -6,14 +6,14 @@ A thin Zig web toolkit built around a merjs-style request -> route -> response p
 
 - Thin request/response handlers: `fn(req: zono.Request) zono.Response`
 - Explicit route registration through `zono.App`
-- Exact-path plus dynamic-parameter routing through `zono.Router`
+- Exact-path, optional params, regex params, and middle-wildcard routing through `zono.Router`
 - Hono-inspired route composition and middleware with `basePath()`, `route()`, `mount()`, `use()`, `useAt()`, `on()`, and `all()`
 - Minimal Hono-style `Context` handlers and middleware through `fn(c: *zono.Context) zono.Response`
-- App-level error handling through `app.onError()` and `!zono.Response` handlers
+- App-level and route-level error handling through `app.onError()`, `zono.routeOnError()`, and `!zono.Response` handlers
 - Configurable `strict`, automatic `OPTIONS`, and `405 Method Not Allowed` behavior through `App.initWithOptions()`
 - Minimal server runtime under `zono.Server`
-- Request helpers for params, parsed params/query/cookie/header views, header lookup, cookies, and typed JSON parsing
-- `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing through `Request.parseBody()`, `Response.cookie()`, and a low-level `zono.body()` response helper
+- Request helpers for params, parsed params/query/cookie/header views, `.all` aggregate access, cookies, and typed JSON parsing
+- `application/x-www-form-urlencoded` parsing, Hono-style `multipart/form-data` body/file parsing, and dotted-key grouping through `Request.parseBody()`, `Response.cookie()`, and a low-level `zono.body()` response helper
 - `app.request()` for lightweight route testing without the server runtime
 
 ## Quick Start
@@ -102,6 +102,26 @@ pub fn main() !void {
 }
 ```
 
+### Advanced Route Patterns
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+fn show(req: zono.Request) zono.Response {
+    return zono.text(.ok, req.param("id") orelse "index");
+}
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/posts/:id?", show);
+    try app.get("/assets/:version{[0-9]+}", show);
+    try app.get("/docs/*/edit", show);
+}
+```
+
 ### Middleware
 
 ```zig
@@ -146,6 +166,36 @@ pub fn main() !void {
 }
 ```
 
+### Route-Level Error Handling
+
+```zig
+const std = @import("std");
+const zono = @import("zono");
+
+fn auth(req: zono.Request, next: zono.App.Next) zono.Response {
+    return next.run(req);
+}
+
+pub fn main() !void {
+    var app = zono.App.init(std.heap.page_allocator);
+    defer app.deinit();
+
+    try app.get("/posts/:id", .{
+        zono.routeOnError(struct {
+            fn run(err: anyerror, c: *zono.Context) zono.Response {
+                return c.textWithStatus(.bad_request, @errorName(err));
+            }
+        }.run),
+        auth,
+        struct {
+            fn run(_: zono.Request) !zono.Response {
+                return error.InvalidPostId;
+            }
+        }.run,
+    });
+}
+```
+
 ### Context
 
 ```zig
@@ -161,8 +211,7 @@ fn poweredBy(c: *zono.Context, next: zono.Context.Next) zono.Response {
 
 fn hello(c: *zono.Context) zono.Response {
     const framework = c.vars.get([]const u8, "framework") orelse "unknown";
-    c.status(.created);
-    return c.json(.{
+    return c.jsonWithStatus(.created, .{
         .message = "hello",
         .framework = framework,
     });
@@ -212,12 +261,29 @@ test "search route" {
 const zono = @import("zono");
 
 fn showPost(req: zono.Request) zono.Response {
-    var params = req.parseParams(.{}) catch return zono.internalError("invalid params");
+    var params = req.param(.all) catch return zono.internalError("invalid params");
     defer params.deinit();
 
     const slug = params.value("slug") orelse "missing";
     const body = req.allocator.dupe(u8, slug) catch return zono.internalError("alloc failed");
     return zono.text(.ok, body);
+}
+```
+
+### Aggregating Query And Cookies
+
+```zig
+const zono = @import("zono");
+
+fn search(req: zono.Request) zono.Response {
+    var query = req.query(.all) catch return zono.text(.bad_request, "invalid query");
+    defer query.deinit();
+
+    var cookies = req.cookie(.all) catch return zono.internalError("invalid cookies");
+    defer cookies.deinit();
+
+    _ = cookies.value("theme");
+    return zono.text(.ok, query.value("q") orelse "missing");
 }
 ```
 
@@ -311,12 +377,16 @@ const zono = @import("zono");
 fn submit(req: zono.Request) zono.Response {
     var body = req.parseBody(.{
         .all = true,
+        .dot = true,
     }) catch return zono.text(.bad_request, "invalid form body");
     defer body.deinit();
 
-    const tags = body.values("tag") orelse &.{};
-    _ = tags;
+    var user = body.group("user") catch return zono.internalError("group failed");
+    defer user.deinit();
 
-    return zono.text(.ok, body.value("title") orelse "missing");
+    const avatar = user.file("avatar") orelse return zono.text(.bad_request, "missing avatar");
+    _ = avatar;
+
+    return zono.text(.ok, user.value("name") orelse "missing");
 }
 ```

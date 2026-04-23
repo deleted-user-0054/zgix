@@ -58,6 +58,7 @@ pub const parseJson = response.parseJson;
 pub const generateCookie = response.generateCookie;
 pub const generateDeleteCookie = response.generateDeleteCookie;
 pub const cleanPath = path.cleanPath;
+pub const routeOnError = app.routeOnError;
 
 test {
     _ = request;

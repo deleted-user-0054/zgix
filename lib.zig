@@ -60,6 +60,7 @@ pub const parseJson = root.parseJson;
 pub const generateCookie = root.generateCookie;
 pub const generateDeleteCookie = root.generateDeleteCookie;
 pub const cleanPath = root.cleanPath;
+pub const routeOnError = root.routeOnError;
 
 test {
     _ = root;

@@ -20,6 +20,7 @@ pub const ParseBodyError = FormError || error{
 
 pub const ParseBodyOptions = struct {
     all: bool = false,
+    dot: bool = false,
 };
 
 pub const ParsedBodyEntry = struct {
@@ -49,6 +50,7 @@ pub const ParsedBodyField = struct {
 pub const ParsedBody = struct {
     allocator: std.mem.Allocator,
     entries: []const ParsedBodyEntry = &.{},
+    dot: bool = false,
 
     pub fn get(self: ParsedBody, name: []const u8) ?ParsedBodyField {
         for (self.entries) |entry| {
@@ -72,6 +74,16 @@ pub const ParsedBody = struct {
 
     pub fn entriesSlice(self: ParsedBody) []const ParsedBodyEntry {
         return self.entries;
+    }
+
+    pub fn group(self: ParsedBody, name: []const u8) std.mem.Allocator.Error!ParsedBody {
+        if (!self.dot) {
+            return .{
+                .allocator = self.allocator,
+            };
+        }
+
+        return try cloneParsedBodyGroup(self.allocator, self.entries, name, self.dot);
     }
 
     pub fn deinit(self: *ParsedBody) void {
@@ -257,6 +269,17 @@ pub const ParsedMultipart = struct {
         return self.files.files(name);
     }
 
+    pub fn group(self: ParsedMultipart, name: []const u8) std.mem.Allocator.Error!ParsedMultipart {
+        if (!self.fields.dot) {
+            return init(self.fields.allocator);
+        }
+
+        return .{
+            .fields = try cloneParsedBodyGroup(self.fields.allocator, self.fields.entries, name, self.fields.dot),
+            .files = try cloneParsedMultipartFileGroup(self.files.allocator, self.files.entries, name),
+        };
+    }
+
     pub fn deinit(self: *ParsedMultipart) void {
         self.fields.deinit();
         self.files.deinit();
@@ -295,7 +318,24 @@ pub const Request = struct {
         return self.context_state;
     }
 
-    pub fn param(self: Request, name: []const u8) ?[]const u8 {
+    pub fn param(self: Request, name_or_mode: anytype) ParamResultType(@TypeOf(name_or_mode)) {
+        const NameType = @TypeOf(name_or_mode);
+
+        if (comptime isStringLike(NameType)) {
+            return self.paramValue(name_or_mode);
+        }
+
+        if (NameType == @TypeOf(.enum_literal)) {
+            if (name_or_mode != .all) {
+                @compileError("Request.param only supports .all for aggregate param access.");
+            }
+            return self.parseParams(.{});
+        }
+
+        @compileError("Request.param accepts a param name string or .all.");
+    }
+
+    fn paramValue(self: Request, name: []const u8) ?[]const u8 {
         for (self.params) |entry| {
             if (std.mem.eql(u8, entry.key, name)) return entry.value;
         }
@@ -310,6 +350,7 @@ pub const Request = struct {
         if (self.params.len == 0) {
             return .{
                 .allocator = self.allocator,
+                .dot = param_options.dot,
             };
         }
 
@@ -330,6 +371,7 @@ pub const Request = struct {
 
         return .{
             .allocator = self.allocator,
+            .dot = param_options.dot,
             .entries = try entries.toOwnedSlice(self.allocator),
         };
     }
@@ -349,14 +391,28 @@ pub const Request = struct {
         return null;
     }
 
-    pub fn query(self: Request, name: []const u8) ?[]const u8 {
-        return self.queryParam(name);
+    pub fn query(self: Request, name_or_mode: anytype) QueryResultType(@TypeOf(name_or_mode)) {
+        const NameType = @TypeOf(name_or_mode);
+
+        if (comptime isStringLike(NameType)) {
+            return self.queryParam(name_or_mode);
+        }
+
+        if (NameType == @TypeOf(.enum_literal)) {
+            if (name_or_mode != .all) {
+                @compileError("Request.query only supports .all for aggregate query access.");
+            }
+            return self.parseQuery(.{});
+        }
+
+        @compileError("Request.query accepts a query name string or .all.");
     }
 
     pub fn parseQuery(self: Request, query_options: ParseBodyOptions) FormError!ParsedBody {
         if (self.query_string.len == 0) {
             return .{
                 .allocator = self.allocator,
+                .dot = query_options.dot,
             };
         }
 
@@ -474,7 +530,24 @@ pub const Request = struct {
         return std.ascii.eqlIgnoreCase(content_type, value);
     }
 
-    pub fn cookie(self: Request, name: []const u8) ?[]const u8 {
+    pub fn cookie(self: Request, name_or_mode: anytype) CookieResultType(@TypeOf(name_or_mode)) {
+        const NameType = @TypeOf(name_or_mode);
+
+        if (comptime isStringLike(NameType)) {
+            return self.cookieValue(name_or_mode);
+        }
+
+        if (NameType == @TypeOf(.enum_literal)) {
+            if (name_or_mode != .all) {
+                @compileError("Request.cookie only supports .all for aggregate cookie access.");
+            }
+            return self.cookies();
+        }
+
+        @compileError("Request.cookie accepts a cookie name string or .all.");
+    }
+
+    fn cookieValue(self: Request, name: []const u8) ?[]const u8 {
         var rest = if (self.cookies_raw.len > 0)
             self.cookies_raw
         else
@@ -519,7 +592,9 @@ pub const Request = struct {
 
     pub fn parseBody(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedFormData {
         if (self.body.len == 0) {
-            return ParsedFormData.init(self.allocator);
+            var parsed = ParsedFormData.init(self.allocator);
+            parsed.fields.dot = body_options.dot;
+            return parsed;
         }
         if (self.hasContentType("application/x-www-form-urlencoded")) {
             return try parseUrlEncodedFormData(self.allocator, self.body, body_options);
@@ -534,7 +609,9 @@ pub const Request = struct {
 
     pub fn parseMultipart(self: Request, body_options: ParseBodyOptions) ParseBodyError!ParsedFormData {
         if (self.body.len == 0) {
-            return ParsedFormData.init(self.allocator);
+            var parsed = ParsedFormData.init(self.allocator);
+            parsed.fields.dot = body_options.dot;
+            return parsed;
         }
         if (!self.hasContentType("multipart/form-data")) {
             return error.UnsupportedContentType;
@@ -624,6 +701,24 @@ fn HeaderResultType(comptime NameType: type) type {
     if (comptime isStringLike(NameType)) return ?[]const u8;
     if (NameType == @TypeOf(.enum_literal)) return std.mem.Allocator.Error!ParsedHeaders;
     @compileError("Request.header accepts a header name string or .all.");
+}
+
+fn ParamResultType(comptime NameType: type) type {
+    if (comptime isStringLike(NameType)) return ?[]const u8;
+    if (NameType == @TypeOf(.enum_literal)) return std.mem.Allocator.Error!ParsedBody;
+    @compileError("Request.param accepts a param name string or .all.");
+}
+
+fn QueryResultType(comptime NameType: type) type {
+    if (comptime isStringLike(NameType)) return ?[]const u8;
+    if (NameType == @TypeOf(.enum_literal)) return FormError!ParsedBody;
+    @compileError("Request.query accepts a query name string or .all.");
+}
+
+fn CookieResultType(comptime NameType: type) type {
+    if (comptime isStringLike(NameType)) return ?[]const u8;
+    if (NameType == @TypeOf(.enum_literal)) return std.mem.Allocator.Error!ParsedBody;
+    @compileError("Request.cookie accepts a cookie name string or .all.");
 }
 
 fn isStringLike(comptime T: type) bool {
@@ -716,6 +811,54 @@ fn appendParsedBodyEntry(
         .values = values,
         .array_like = std.mem.endsWith(u8, key, "[]"),
     });
+}
+
+fn cloneParsedBodyGroup(
+    allocator: std.mem.Allocator,
+    entries: []const ParsedBodyEntry,
+    name: []const u8,
+    dot: bool,
+) std.mem.Allocator.Error!ParsedBody {
+    var prefix_buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer prefix_buffer.deinit(allocator);
+    try prefix_buffer.appendSlice(allocator, name);
+    try prefix_buffer.append(allocator, '.');
+
+    var grouped_entries: std.ArrayListUnmanaged(ParsedBodyEntry) = .empty;
+    errdefer {
+        deinitParsedBodyEntries(allocator, grouped_entries.items);
+        grouped_entries.deinit(allocator);
+    }
+
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, prefix_buffer.items)) continue;
+
+        const child_key = try allocator.dupe(u8, entry.key[prefix_buffer.items.len..]);
+        errdefer allocator.free(child_key);
+        const values = try allocator.alloc([]const u8, entry.values.len);
+        var filled_values: usize = 0;
+        errdefer {
+            for (values[0..filled_values]) |value| allocator.free(value);
+            allocator.free(values);
+        }
+
+        for (entry.values, 0..) |value, index| {
+            values[index] = try allocator.dupe(u8, value);
+            filled_values = index + 1;
+        }
+
+        try grouped_entries.append(allocator, .{
+            .key = child_key,
+            .values = values,
+            .array_like = entry.array_like,
+        });
+    }
+
+    return .{
+        .allocator = allocator,
+        .entries = try grouped_entries.toOwnedSlice(allocator),
+        .dot = dot,
+    };
 }
 
 fn deinitParsedBodyEntries(allocator: std.mem.Allocator, entries: []const ParsedBodyEntry) void {
@@ -833,6 +976,7 @@ fn parseUrlEncodedPairs(
 
     return .{
         .allocator = allocator,
+        .dot = body_options.dot,
         .entries = try entries.toOwnedSlice(allocator),
     };
 }
@@ -864,6 +1008,7 @@ fn parseCookiePairs(
 
     return .{
         .allocator = allocator,
+        .dot = false,
         .entries = try entries.toOwnedSlice(allocator),
     };
 }
@@ -940,6 +1085,7 @@ fn parseMultipartForm(
     return .{
         .fields = .{
             .allocator = allocator,
+            .dot = body_options.dot,
             .entries = try field_entries.toOwnedSlice(allocator),
         },
         .files = .{
@@ -1016,6 +1162,64 @@ fn appendParsedMultipartFileEntry(
         .files = files,
         .array_like = std.mem.endsWith(u8, key, "[]"),
     });
+}
+
+fn cloneParsedMultipartFileGroup(
+    allocator: std.mem.Allocator,
+    entries: []const ParsedMultipartFileEntry,
+    name: []const u8,
+) std.mem.Allocator.Error!ParsedMultipartFiles {
+    var prefix_buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer prefix_buffer.deinit(allocator);
+    try prefix_buffer.appendSlice(allocator, name);
+    try prefix_buffer.append(allocator, '.');
+
+    var grouped_entries: std.ArrayListUnmanaged(ParsedMultipartFileEntry) = .empty;
+    errdefer {
+        deinitParsedMultipartFileEntries(allocator, grouped_entries.items);
+        grouped_entries.deinit(allocator);
+    }
+
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, prefix_buffer.items)) continue;
+
+        const child_key = try allocator.dupe(u8, entry.key[prefix_buffer.items.len..]);
+        errdefer allocator.free(child_key);
+
+        const files = try allocator.alloc(ParsedMultipartFile, entry.files.len);
+        var filled_files: usize = 0;
+        errdefer {
+            for (files[0..filled_files]) |file| {
+                allocator.free(file.filename);
+                if (file.content_type) |content_type| allocator.free(content_type);
+                allocator.free(file.content);
+            }
+            allocator.free(files);
+        }
+
+        for (entry.files, 0..) |file, index| {
+            files[index] = .{
+                .filename = try allocator.dupe(u8, file.filename),
+                .content_type = if (file.content_type) |content_type|
+                    try allocator.dupe(u8, content_type)
+                else
+                    null,
+                .content = try allocator.dupe(u8, file.content),
+            };
+            filled_files = index + 1;
+        }
+
+        try grouped_entries.append(allocator, .{
+            .key = child_key,
+            .files = files,
+            .array_like = entry.array_like,
+        });
+    }
+
+    return .{
+        .allocator = allocator,
+        .entries = try grouped_entries.toOwnedSlice(allocator),
+    };
 }
 
 fn extractMultipartBoundary(raw_content_type: []const u8) ?[]const u8 {
@@ -1501,5 +1705,90 @@ test "request parseBody multipart returns files directly" {
     const avatar = body.file("avatar").?;
     try std.testing.expectEqualStrings("a.txt", avatar.filename);
     try std.testing.expectEqualStrings("text/plain", avatar.content_type.?);
+    try std.testing.expectEqualStrings("hello", avatar.content);
+}
+
+test "request param .all returns an aggregated params view" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = Request.init(arena.allocator(), .GET, "/users/42");
+    req.params = &.{
+        .{ .key = "id", .value = "42" },
+        .{ .key = "tag[]", .value = "zig" },
+        .{ .key = "tag[]", .value = "router" },
+    };
+
+    var parsed = try req.param(.all);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("42", parsed.value("id").?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.values("tag[]").?.len);
+}
+
+test "request query .all returns a parsed query view" {
+    var req = Request.init(std.testing.allocator, .GET, "/search");
+    req.query_string = "q=zig&tag=router&tag=web";
+
+    var parsed = try req.query(.all);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("zig", parsed.value("q").?);
+    try std.testing.expectEqualStrings("web", parsed.value("tag").?);
+}
+
+test "request cookie .all returns an aggregated cookie view" {
+    var req = Request.init(std.testing.allocator, .GET, "/");
+    req.cookies_raw = "session=abc; theme=dark";
+
+    var parsed = try req.cookie(.all);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("abc", parsed.value("session").?);
+    try std.testing.expectEqualStrings("dark", parsed.value("theme").?);
+}
+
+test "request parseQuery dot groups nested keys" {
+    var req = Request.init(std.testing.allocator, .GET, "/search");
+    req.query_string = "user.name=hyird&user.role=admin";
+
+    var parsed = try req.parseQuery(.{
+        .dot = true,
+    });
+    defer parsed.deinit();
+
+    var user = try parsed.group("user");
+    defer user.deinit();
+
+    try std.testing.expectEqualStrings("hyird", user.value("name").?);
+    try std.testing.expectEqualStrings("admin", user.value("role").?);
+}
+
+test "request parseBody dot groups nested fields and files" {
+    var req = Request.init(std.testing.allocator, .POST, "/submit");
+    req.header_list = &.{
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=zono-boundary" },
+    };
+    req.body =
+        "--zono-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"user.name\"\r\n\r\n" ++
+        "hyird\r\n" ++
+        "--zono-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"user.avatar\"; filename=\"a.txt\"\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++
+        "hello\r\n" ++
+        "--zono-boundary--\r\n";
+
+    var parsed = try req.parseBody(.{
+        .dot = true,
+    });
+    defer parsed.deinit();
+
+    var user = try parsed.group("user");
+    defer user.deinit();
+
+    try std.testing.expectEqualStrings("hyird", user.value("name").?);
+    const avatar = user.file("avatar").?;
+    try std.testing.expectEqualStrings("a.txt", avatar.filename);
     try std.testing.expectEqualStrings("hello", avatar.content);
 }

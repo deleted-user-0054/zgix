@@ -11,6 +11,17 @@ const Router = router_mod.Router;
 const Handler = router_mod.Handler;
 const ErrorHandler = *const fn (err: anyerror, req: Request) Response;
 
+fn RouteOnErrorMarker(comptime handler: ErrorHandler) type {
+    return struct {
+        pub const is_route_on_error = true;
+        pub const route_error_handler = handler;
+    };
+}
+
+pub fn routeOnError(comptime handler: anytype) RouteOnErrorMarker(resolveErrorHandler(handler).handler) {
+    return .{};
+}
+
 pub const App = struct {
     const Self = @This();
     const MountTarget = union(enum) {
@@ -350,7 +361,7 @@ pub const App = struct {
         lookup_req.path = canonicalPath(req.path, self.strict);
         const lookup = router.lookup(lookup_req);
         if (lookup.handler) |handler| {
-            defer if (lookup.params_owned and lookup.params.len > 0) req.allocator.free(lookup.params);
+            defer if (lookup.params_storage) |storage| req.allocator.free(storage);
             var routed_req = req;
             routed_req.params = lookup.params;
             return handler(routed_req);
@@ -785,7 +796,15 @@ fn resolveHandlerFn(comptime target: anytype, comptime FnType: type) ResolvedHan
     @compileError("Route handlers must be fn(req: zono.Request) zono.Response, fn(req: zono.Request) !zono.Response, fn(c: *zono.Context) zono.Response, or fn(c: *zono.Context) !zono.Response.");
 }
 
-fn resolveHandlerChain(comptime target: anytype, comptime TargetType: type) ResolvedHandler {
+fn isRouteOnErrorMarker(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info == .@"struct" or info == .@"enum" or info == .@"union") {
+        return @hasDecl(T, "is_route_on_error") and @hasDecl(T, "route_error_handler");
+    }
+    return false;
+}
+
+fn resolveHandlerChain(target: anytype, comptime TargetType: type) ResolvedHandler {
     const fields = std.meta.fields(TargetType);
     if (fields.len == 0) {
         @compileError("Route handler tuples must contain at least one handler.");
@@ -799,20 +818,47 @@ fn resolveHandlerChain(comptime target: anytype, comptime TargetType: type) Reso
         return resolved;
     }
 
-    comptime var middlewares: [fields.len - 1]App.Middleware = undefined;
-    inline for (fields[0 .. fields.len - 1], 0..) |field, index| {
-        const resolved = comptime resolveMiddlewareHandler(@field(target, field.name));
-        middlewares[index] = resolved.handler;
+    comptime var route_error_handler: ?ErrorHandler = null;
+    comptime var middleware_count: usize = 0;
+    inline for (fields[0 .. fields.len - 1]) |field| {
+        const item = @field(target, field.name);
+        if (comptime isRouteOnErrorMarker(@TypeOf(item))) {
+            if (route_error_handler != null) {
+                @compileError("Route handler tuples may include only one zono.routeOnError(...) marker.");
+            }
+            route_error_handler = @TypeOf(item).route_error_handler;
+            uses_error = true;
+            continue;
+        }
+
+        const resolved = comptime resolveMiddlewareHandler(item);
+        middleware_count += 1;
         uses_context = uses_context or resolved.uses_context;
         uses_error = uses_error or resolved.uses_error;
+    }
+
+    comptime var middlewares: [middleware_count]App.Middleware = undefined;
+    comptime var middleware_index: usize = 0;
+    inline for (fields[0 .. fields.len - 1]) |field| {
+        const item = @field(target, field.name);
+        if (comptime isRouteOnErrorMarker(@TypeOf(item))) continue;
+
+        const resolved = comptime resolveMiddlewareHandler(item);
+        middlewares[middleware_index] = resolved.handler;
+        middleware_index += 1;
     }
 
     const final_resolved = comptime resolveHandler(@field(target, fields[fields.len - 1].name));
     uses_context = uses_context or final_resolved.uses_context;
     uses_error = uses_error or final_resolved.uses_error;
 
+    const chained_handler = if (route_error_handler) |handler|
+        wrapRouteOnError(handler, wrapRouteChain(middlewares, final_resolved.handler))
+    else
+        wrapRouteChain(middlewares, final_resolved.handler);
+
     return .{
-        .handler = wrapRouteChain(middlewares, final_resolved.handler),
+        .handler = chained_handler,
         .uses_context = uses_context,
         .uses_error = uses_error,
     };
@@ -1062,6 +1108,25 @@ fn dispatchHandlerError(req: Request, err: anyerror) Response {
     }
 
     return response_mod.text(.internal_server_error, "Internal Server Error");
+}
+
+fn wrapRouteOnError(comptime route_error_handler: ErrorHandler, comptime inner_handler: Handler) Handler {
+    return struct {
+        fn run(req: Request) Response {
+            var local_state = context_mod.SharedState.init(req.allocator);
+            var handled_req = req;
+            const owns_context_state = handled_req.context_state == null;
+            if (owns_context_state) handled_req.context_state = @ptrCast(&local_state);
+            defer if (owns_context_state) local_state.deinit();
+
+            const state: *context_mod.SharedState = @ptrCast(@alignCast(handled_req.context_state.?));
+            const previous_on_error_handler = state.on_error_handler;
+            state.on_error_handler = route_error_handler;
+            defer state.on_error_handler = previous_on_error_handler;
+
+            return inner_handler(handled_req);
+        }
+    }.run;
 }
 
 fn wrapRouteChain(comptime middlewares: anytype, comptime final_handler: Handler) Handler {
@@ -1777,6 +1842,95 @@ test "app route tuples work with onError and c.err" {
     try std.testing.expectEqual(std.http.Status.bad_request, res.status);
     try std.testing.expectEqualStrings("TupleBoom", res.body);
     try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-error").?);
+}
+
+test "app routeOnError overrides app onError for a single route" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    app.onError(struct {
+        fn run(_: anyerror, _: Request) Response {
+            return response_mod.text(.internal_server_error, "app");
+        }
+    }.run);
+    try app.get("/route-error", .{
+        routeOnError(struct {
+            fn run(err: anyerror, c: *Context) Response {
+                return c.textWithStatus(if (err == error.RouteBoom) .unprocessable_entity else .internal_server_error, @errorName(err));
+            }
+        }.run),
+        struct {
+            fn run(_: Request) !Response {
+                return error.RouteBoom;
+            }
+        }.run,
+    });
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/route-error"));
+    try std.testing.expectEqual(std.http.Status.unprocessable_entity, res.status);
+    try std.testing.expectEqualStrings("RouteBoom", res.body);
+}
+
+test "app routeOnError works with route middleware and context sugar" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/route-error-ctx", .{
+        routeOnError(struct {
+            fn run(err: anyerror, c: *Context) Response {
+                const Payload = struct {
+                    @"error": []const u8,
+                };
+                _ = c.header("x-route-level", "1");
+                const status_code: std.http.Status = if (err == error.RouteCtxBoom) .bad_request else .internal_server_error;
+                const payload: Payload = .{
+                    .@"error" = @errorName(err),
+                };
+                return c.jsonWithStatus(status_code, payload);
+            }
+        }.run),
+        struct {
+            fn run(c: *Context, next: Context.Next) Response {
+                next.run();
+                if (c.err != null) {
+                    _ = c.header("x-route-error", "1");
+                }
+                return c.takeResponse();
+            }
+        }.run,
+        struct {
+            fn run(_: Request) !Response {
+                return error.RouteCtxBoom;
+            }
+        }.run,
+    });
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/route-error-ctx"));
+    try std.testing.expectEqual(std.http.Status.bad_request, res.status);
+    try std.testing.expectEqualStrings("{\"error\":\"RouteCtxBoom\"}", res.body);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-level").?);
+    try std.testing.expectEqualStrings("1", responseHeaderValue(res, "x-route-error").?);
+}
+
+test "app context sugar can set status inline" {
+    var app = App.init(std.testing.allocator);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try app.get("/ctx-sugar", struct {
+        fn run(c: *Context) Response {
+            return c.textWithStatus(.created, "created");
+        }
+    }.run);
+
+    const res = app.handle(Request.init(arena.allocator(), .GET, "/ctx-sugar"));
+    try std.testing.expectEqual(std.http.Status.created, res.status);
+    try std.testing.expectEqualStrings("created", res.body);
 }
 
 test "app mount delegates prefixed requests to mounted apps" {
